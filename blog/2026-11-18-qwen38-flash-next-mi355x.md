@@ -51,12 +51,12 @@ For inference, five properties matter:
 - **Hybrid attention.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context. The other 12 use QuerySparse Attention: each query attends to a learned selection of at most 2,051 past positions (512 compressed blocks of 4, plus 3), with 24 query heads sharing 2 KV heads of dimension 256.
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix (a 10,240 → 320 → 10,240 low-rank gate) collapses them into one input. It is small but runs in every layer at every step.
 - **Sparse MoE.** Every layer is a sparse MoE: 512 routed experts with a softmax router, 10 routed experts active per token, plus one shared expert (fused into the routed MXFP4 experts as expert 512). **[TODO: total and active parameter counts.]**
-- **Per-layer embeddings (PLE).** A large n-gram embedding table feeds every layer. It is read sparsely, which makes it a good candidate for host memory.
+- **Per-layer embeddings (PLE).** A large n-gram embedding table feeds the model's PLE layer (layer 1 in this checkpoint). It is read sparsely, which makes it a good candidate for host memory.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding (SGLang `NEXTN`), verified by the target in one forward pass.
 
-## The checkpoint: MXFP4 experts with AMD Quark
+### The checkpoint: MXFP4 experts with AMD Quark
 
-We serve [`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8), produced with AMD Quark:
+The model is served in a quantized form that fits on one GPU. We serve [`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8), produced with AMD Quark:
 
 | Component | Format |
 |---|---|
