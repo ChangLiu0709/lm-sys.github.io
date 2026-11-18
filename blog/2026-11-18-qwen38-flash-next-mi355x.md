@@ -183,11 +183,27 @@ GSM8K, full 1,319-question test set, served with recipe 2 at 16 concurrent reque
 
 The newer changes were each checked on GSM8K with real MTP verification in their own pull requests: 96.3% with the fused hyper-connection norm on against 96.6% off ([sglang#48648](https://github.com/sgl-project/sglang/pull/48648)), 96.7% with the fused GDN chunked prefill and 96.9–97.0% with the staged one ([sglang#44103](https://github.com/sgl-project/sglang/pull/44103)), 95.8% for the top-k-only verify sampling and for main ([sglang#48090](https://github.com/sgl-project/sglang/pull/48090)), and 96.8% for the QSA indexer change on the full stack ([sglang#48649](https://github.com/sgl-project/sglang/pull/48649)). **[TODO: one GSM8K run of the final recipe, plus AIME / LiveCodeBench / long-context needle results, if we want parity with the MiniMax post.]**
 
-## What's next
+## AMD Software Stacks
 
-- **Landing the remaining PRs.** The seven SGLang changes applied as patches ([#48648](https://github.com/sgl-project/sglang/pull/48648), [#45196](https://github.com/sgl-project/sglang/pull/45196), [#48649](https://github.com/sgl-project/sglang/pull/48649), [#45529](https://github.com/sgl-project/sglang/pull/45529), [#41879](https://github.com/sgl-project/sglang/pull/41879), [#44103](https://github.com/sgl-project/sglang/pull/44103) on top of [#39595](https://github.com/sgl-project/sglang/pull/39595), and [#48090](https://github.com/sgl-project/sglang/pull/48090)) are in review, so a future SGLang ROCm image will serve these recipes without patches.
-- **bf16 `lm_head` through AITER.** [sglang#47485](https://github.com/sgl-project/sglang/pull/47485) routes the `lm_head` GEMM through AITER's tuned tgemm path (with the tuned shapes from aiter#6769); it is in review and gave the best 16-agent smoke-test result so far.
-- **Wider monokernel steps.** The monokernel stops at 8 requests; extending it to 12–16 would bring its launch savings to the high-concurrency points.
+Everything in this post runs on the public `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261117` image, plus the SGLang source patches described above. The AMD pieces of that stack:
+
+| Component | Version in the image | Role for Qwen3.8-Flash-Next |
+|---|---|---|
+| [ROCm](https://rocm.docs.amd.com/) | 10.0.0 | GPU runtime and compiler for MI355X (gfx950) |
+| PyTorch | 2.11.0+rocm10.0.0 | tensors, CUDA-graph capture and the eager fallback paths |
+| Triton | 3.8.0 (ROCm build) | SGLang's remaining Triton kernels, such as the QSA bookkeeping and the dense sampling fallback |
+| [AITER](https://github.com/ROCm/aiter) | 0.1.29.dev156 (`581579ab`, 2026-11-07) | MXFP4 MoE, FP8 and BF16 GEMMs with tuned gfx950 tables, unified attention, top-k gating, and the FlyDSL kernels for GDN, QSA and hyper-connections |
+| [FlyDSL](https://github.com/ROCm/FlyDSL) | 0.4.2 | the kernel language behind the fused GDN, QSA and hyper-connection kernels and the monokernel |
+| [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) | `a04ceab` (2026-11-16) | the Qwen3.8-Flash-Next monokernel for MTP target verify and draft steps |
+| [SGLang](https://github.com/sgl-project/sglang) | 0.5.23.dev20261117 (`c67db7c762`) | serving: scheduler, speculative decoding (NEXTN), ReplaySSM, radix cache and HiCache |
+| [AMD Quark](https://quark.docs.amd.com/) | used offline | quantizes the checkpoint to MXFP4 experts, FP8 attention and an FP8 PLE table |
+
+Two things in this stack are worth knowing when you reproduce the results:
+
+- **The AITER pin carries the kernels.** SGLang's AITER pin was moved to `581579ab` in [sglang#50759](https://github.com/sgl-project/sglang/pull/50759), which contains aiter#5992, #5993, #6496, #6670 and #6769. Earlier images (for example `20261113`) still had the October AITER and none of these kernels, so use `20261117` or later.
+- **The monokernel and the FlyDSL kernels are optional at runtime.** SGLang falls back to its own path when a kernel does not accept a step or when FlyDSL is not importable, so the server still starts, only slower. (The InferenceX patch script is stricter and fails the worker if a FlyDSL module is missing, so a benchmark never runs on the slow path by accident.)
+
+**[TODO: Quark version used for the checkpoint, and the minimum driver / firmware versions we tested.]**
 
 ## Acknowledgements
 
