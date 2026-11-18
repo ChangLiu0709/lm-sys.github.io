@@ -6,7 +6,7 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-*Draft, 2026-11-18. The technical sections (what we optimized, how to run, environment variables, test configuration) were refreshed against the `20261117` image and the current patch set. The numbers in Performance and Accuracy are from 2026-10-28 and still need to be re-measured. Items marked **[TODO]** need a measurement or a decision before publication.*
+*Draft, 2026-11-18. The technical sections (kernel and runtime optimizations, how to run, environment variables, test configuration) were refreshed against the `20261117` image and the current patch set. The numbers in Performance and Accuracy are from 2026-10-28 and still need to be re-measured. Items marked **[TODO]** need a measurement or a decision before publication.*
 
 ## TL;DR
 
@@ -25,7 +25,7 @@ This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs 
 
 ## Performance
 
-InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1). The last column names the decode path; the monokernel and ReplaySSM are explained in [What we optimized](#what-we-optimized).
+InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1). The last column names the decode path; the monokernel and ReplaySSM are explained in [Kernel and runtime optimizations](#kernel-and-runtime-optimizations-on-mi355x).
 
 | Agents | Total tok/s/GPU | Output tok/s/GPU | Interactivity p50 / p90 (tok/s/user) | TTFT p50 / p90 (s) | TPOT p50 (ms) | Decode path |
 |---:|---:|---:|---:|---:|---:|---|
@@ -69,7 +69,7 @@ The whole checkpoint is about 116 GiB, so it fits on one MI355X (288 GB HBM3E) w
 
 The MTP draft is quantized like the target, so the draft's MoE runs on the same MXFP4 kernels.
 
-## What we optimized
+## Kernel and runtime optimizations on MI355X
 
 ### Memory: the PLE table on the host
 
