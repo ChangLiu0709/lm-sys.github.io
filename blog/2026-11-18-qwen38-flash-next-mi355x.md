@@ -21,7 +21,28 @@ type: blog
 
 Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. Its architecture combines three ideas that each need their own kernels: linear attention through Gated DeltaNet for most layers, a learned sparse attention (QSA) for the rest, and hyper-connections that carry four copies of the hidden state between layers. Agentic coding adds a fourth requirement: very long, mostly shared prompts (tens to hundreds of thousands of tokens) with short, latency-sensitive replies.
 
-This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang: the quantized checkpoint, the kernels we wrote or tuned in AITER and FlyDSL, the FlyDSL monokernel for speculative decoding at low concurrency, the measured performance on the InferenceX AgentX benchmark, and a serving recipe.
+This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with the measured performance on the InferenceX AgentX benchmark, then cover the model, the quantized checkpoint, the kernels we wrote or tuned in AITER and FlyDSL, the FlyDSL monokernel for speculative decoding at low concurrency, and a serving recipe.
+
+## Performance
+
+InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1). The last column names the decode path; the monokernel and ReplaySSM are explained in [What we optimized](#what-we-optimized).
+
+| Agents | Total tok/s/GPU | Output tok/s/GPU | Interactivity p50 / p90 (tok/s/user) | TTFT p50 / p90 (s) | TPOT p50 (ms) | Decode path |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 16,613 | 181.0 | 407.1 / 397.4 | 0.33 / 1.43 | 2.46 | monokernel |
+| 2 | 20,580 | 213.6 | 394.6 / 304.6 | 0.30 / 0.89 | 2.53 | monokernel |
+| 4 | 25,223 | 283.2 | 322.5 / 231.1 | 0.29 / 0.74 | 3.10 | monokernel |
+| 8 | 41,098 | 402.3 | 270.8 / 163.7 | 0.32 / 0.84 | 3.69 | monokernel, 1 draft token |
+| 12 | 59,126 | 540.0 | 142.7 / 99.8 | 0.39 / 0.98 | 7.01 | ReplaySSM |
+| 16 | 77,097 | 678.1 | 122.4 / 72.1 | 0.45 / 1.10 | 8.17 | ReplaySSM |
+
+*Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
+
+These rows were measured on 2026-10-28 with the image and patch set of that date (see Test configuration). The 8-agent row used one draft token per step; the monokernel in the current image accepts only 3 draft steps, so that point needs a re-run. **[TODO: replace the table with the current recipe's results at 1, 2, 12, 24, 48 and 80 agents.]**
+
+Following the InferenceX AgentX rules, speculative decoding in these runs uses a fixed, committed acceptance length for this model (2.32 tokens per step at 3 draft steps, 1.65 at 1 step) so that results are comparable across submissions; accuracy is measured separately with real verification.
+
+**[TODO: optionally a "what's coming" row. In October the full patch set, including the PRs still in review, reached 81,208 tok/s/GPU at 151.4 tok/s/user p50 at 16 agents; re-measure it on the current stack.]**
 
 ## Qwen3.8-Flash-Next at a glance
 
@@ -92,27 +113,6 @@ From 12 agents up, the working set is many long, mostly shared prompts, so we ch
 ### Agentic serving configuration
 
 Agent workloads use 16k prefill chunks, page size 64, BF16 Mamba/GDN state, six tokenizer workers, AITER unified attention, streaming every 50 tokens, and the Qwen3 reasoning and Qwen3-Coder tool-call parsers. Admission and the decode CUDA-graph batch equal the number of agents at 1–2 users (monokernel) and twice the number of agents at 12–24 users, so bursts stay inside a captured graph; at 48 and 80 agents both are 128. Every point uses `--mem-fraction-static` as given (`SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1`) instead of the AITER backend's default 0.85 scaling for long contexts, which gives a 3.45M-token pool instead of 2.78M at 12–16 users.
-
-## Performance
-
-InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1).
-
-| Agents | Total tok/s/GPU | Output tok/s/GPU | Interactivity p50 / p90 (tok/s/user) | TTFT p50 / p90 (s) | TPOT p50 (ms) | Decode path |
-|---:|---:|---:|---:|---:|---:|---|
-| 1 | 16,613 | 181.0 | 407.1 / 397.4 | 0.33 / 1.43 | 2.46 | monokernel |
-| 2 | 20,580 | 213.6 | 394.6 / 304.6 | 0.30 / 0.89 | 2.53 | monokernel |
-| 4 | 25,223 | 283.2 | 322.5 / 231.1 | 0.29 / 0.74 | 3.10 | monokernel |
-| 8 | 41,098 | 402.3 | 270.8 / 163.7 | 0.32 / 0.84 | 3.69 | monokernel, 1 draft token |
-| 12 | 59,126 | 540.0 | 142.7 / 99.8 | 0.39 / 0.98 | 7.01 | ReplaySSM |
-| 16 | 77,097 | 678.1 | 122.4 / 72.1 | 0.45 / 1.10 | 8.17 | ReplaySSM |
-
-*Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
-
-These rows were measured on 2026-10-28 with the image and patch set of that date (see Test configuration). The 8-agent row used one draft token per step; the monokernel in the current image accepts only 3 draft steps, so that point needs a re-run. **[TODO: replace the table with the current recipe's results at 1, 2, 12, 24, 48 and 80 agents.]**
-
-Following the InferenceX AgentX rules, speculative decoding in these runs uses a fixed, committed acceptance length for this model (2.32 tokens per step at 3 draft steps, 1.65 at 1 step) so that results are comparable across submissions; accuracy is measured separately with real verification.
-
-**[TODO: optionally a "what's coming" row. In October the full patch set, including the PRs still in review, reached 81,208 tok/s/GPU at 151.4 tok/s/user p50 at 16 agents; re-measure it on the current stack.]**
 
 ## How to run
 
