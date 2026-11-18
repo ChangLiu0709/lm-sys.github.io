@@ -1,6 +1,6 @@
 ---
 title: "Qwen3.8-Flash-Next on AMD Instinct MI355X: serving and optimization with SGLang"
-author: "AMD"
+author: "Chang Liu (@ChangLiu0709), Nikolai (@amd-nprotaso), and Christian Gilli (@amd-cgilli) — AMD"
 date: "November 18, 2026"
 previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
@@ -189,4 +189,4 @@ Measured on one GPU of an 8x AMD Instinct MI355X node in October 2026 with `lmsy
 
 #### Article by
 
-[TODO: authors]
+Authors: Chang Liu (@ChangLiu0709), Nikolai (@amd-nprotaso), and Christian Gilli (@amd-cgilli) — AMD.
