@@ -10,12 +10,7 @@ type: blog
 
 ## TL;DR
 
-- Qwen3.8-Flash-Next, a hybrid linear/sparse-attention Mixture-of-Experts model with native multi-token prediction (MTP), runs on a **single** AMD Instinct™ MI355X GPU with SGLang. The model's 36 Gated DeltaNet (GDN) layers, 12 QuerySparse Attention (QSA) layers, hyper-connections, 512-expert MoE and the MTP draft all run on AITER and FlyDSL kernels.
-- An AMD Quark checkpoint with MXFP4 experts (including the MTP draft), per-channel FP8 attention and an FP8 per-layer-embedding (PLE) table fits in about 116 GiB. Offloading the PLE table to CPU pinned memory cuts GPU weight memory from about 130 GB to 82 GB and grows the KV-cache pool from about 2.1M to 3.7M tokens. At 12 or more agents, an FP8 KV cache for the target and the draft, and at 48–80 agents HiCache host-memory offload, keep long agent contexts resident.
-- At 1–8 concurrent users, the FlyDSL **monokernel** (in [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono), `--enable-amd-monokernel`) runs the whole MTP target-verify step in 13 persistent launches and each draft step in one launch, instead of hundreds of small kernels.
-- Fused FlyDSL kernels replace the hot decode and prefill operators: QSA sparse decode (120 → 33 µs per call, +10% output throughput at 32k/32k with 8 users), a fused hyper-connection norm, mix and inject (1.4–3.0x per site), GDN conv1d and a single-launch GDN chunked prefill (1 launch instead of 8), and a top-k-only target-probability step for MTP verify (3.3 → 1.2 ms of eager time per decode step).
-- On the InferenceX AgentX agentic-coding benchmark (real coding-agent traces, one hour per point), one MI355X served **16,613 total (input + output) tok/s at 407 tok/s per user** for one agent, and **77,097 tok/s at 122 tok/s per user** for 16 agents in our October run. GSM8K is 97.3% (strict match). **[TODO: refresh with the current recipe, including c24/c48/c80.]**
-- Most of the stack is already upstream: the AITER kernels ship in the public `lmsysorg/sglang-rocm` image (AITER `581579ab`), and so do the monokernel, the FlyDSL hyper-connection mix, the AITER top-k router and the ratio-3 GDN packing. Seven SGLang pull requests are still in review and are applied as small source patches on top of the public image; no custom image is needed.
+**[TODO: rewrite once the Performance numbers are re-measured.]**
 
 ## Introduction
 
