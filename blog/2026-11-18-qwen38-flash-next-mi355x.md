@@ -23,12 +23,10 @@ We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its inference, five properties of the model architecture matter:
+The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its inference, these properties of the model architecture matter:
 
 - **Hybrid attention.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context. The other 12 use QuerySparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
-- **Sparse MoE.** Every layer is a sparse MoE: 512 routed experts with a softmax router, 10 routed experts active per token, plus one shared expert.
-- **Per-layer embeddings (PLE).** A large n-gram embedding table feeds the model's PLE layer. It is read sparsely, which makes it a good candidate for host memory.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
 
 // diagram of Qwen3.8 Flash Next model architecture
@@ -36,24 +34,46 @@ The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its infer
 ### The checkpoint: MXFP4 experts with AMD Quark
 
 On AMD MI GPUs, we quantized the Qwen3.8 Flash Next model weights using AMD Quark, which is [one sentence of Quark].
-Then [the model can be served in a quantized form which runs more efficiently and reduce the comsuption of GPU memory]. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`:
-
-| Component                             | Format                                            |
-| ------------------------------------- | ------------------------------------------------- |
-| Routed experts (target and MTP draft) | OCP MXFP4 (FP4 with one E8M0 scale per 32 values) |
-| Attention projections                 | FP8, per-channel scales                           |
-| PLE embedding table                   | FP8 (`float8_e4m3fn`)                             |
-| Router, norms, LM head                | High precision                                    |
+Then [the model can be served in a quantized form which runs more efficiently and reduce the comsuption of GPU memory]. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`.
 
 The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355X (288 GB HBM3E) with room for a large KV cache, which makes ... [once sentence: serving more efficient]. The MTP draft model is also quantized like the way we quantized the target model, so the draft's MoE runs on the same MXFP4 kernels.
 
-## Kernel and Runtime Optimizations on MI355X
+## Kernel Optimization
+
+### QSA - Qwen Sparse Attention
+// analysis
+
+// key change(s)
+
+// performance gain
+
+### Hyper Connections
+// analysis
+
+// key change(s)
+
+// performance gain
 
 
+### GDN
+// analysis
+
+// key change(s)
+
+// performance gain
 
 
+### Monokernel
+// analysis
 
-## Reproduction Commands
+// key change(s)
+
+// performance gain
+
+### Optimization Automation
+// key idea
+
+// ...
 
 
 ## Conclusion
