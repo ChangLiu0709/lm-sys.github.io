@@ -23,7 +23,7 @@ We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-For Qwen3.8-Flash-Next inference, five properties matter:
+The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its inference, five properties of the model architecture matter:
 
 - **Hybrid attention.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context. The other 12 use QuerySparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
