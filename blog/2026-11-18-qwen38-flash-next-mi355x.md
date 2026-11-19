@@ -6,8 +6,6 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-*Draft, 2026-11-18. The technical sections (kernel and runtime optimizations, how to run, environment variables, test configuration) were refreshed against the `20261117` image and the current patch set. The numbers in Performance and Accuracy are from 2026-10-28 and still need to be re-measured. Items marked **[TODO]** need a measurement or a decision before publication.*
-
 Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. Its architecture combines three ideas that each need their own kernels: linear attention through Gated DeltaNet for most layers, a learned sparse attention (QSA) for the rest, and hyper-connections that carry four copies of the hidden state between layers. Agentic coding adds a fourth requirement: very long, mostly shared prompts (tens to hundreds of thousands of tokens) with short, latency-sensitive replies.
 
 This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with the measured performance on the InferenceX AgentX benchmark, then cover the model, the quantized checkpoint, the kernels we wrote or tuned in AITER and FlyDSL, the FlyDSL monokernel for speculative decoding at low concurrency, and a serving recipe.
@@ -16,14 +14,16 @@ This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs 
 
 InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1). The last column names the decode path; the monokernel and ReplaySSM are explained in [Kernel and runtime optimizations](#kernel-and-runtime-optimizations-on-mi355x).
 
-| Agents | Total tok/s/GPU | Output tok/s/GPU | Interactivity p50 / p90 (tok/s/user) | TTFT p50 / p90 (s) | TPOT p50 (ms) | Decode path |
-|---:|---:|---:|---:|---:|---:|---|
-| 1 | 16,613 | 181.0 | 407.1 / 397.4 | 0.33 / 1.43 | 2.46 | monokernel |
-| 2 | 20,580 | 213.6 | 394.6 / 304.6 | 0.30 / 0.89 | 2.53 | monokernel |
-| 4 | 25,223 | 283.2 | 322.5 / 231.1 | 0.29 / 0.74 | 3.10 | monokernel |
-| 8 | 41,098 | 402.3 | 270.8 / 163.7 | 0.32 / 0.84 | 3.69 | monokernel, 1 draft token |
-| 12 | 59,126 | 540.0 | 142.7 / 99.8 | 0.39 / 0.98 | 7.01 | ReplaySSM |
-| 16 | 77,097 | 678.1 | 122.4 / 72.1 | 0.45 / 1.10 | 8.17 | ReplaySSM |
+
+| Agents | Total tok/s/GPU | Output tok/s/GPU | Interactivity p50 / p90 (tok/s/user) | TTFT p50 / p90 (s) | TPOT p50 (ms) | Decode path               |
+| ------ | --------------- | ---------------- | ------------------------------------ | ------------------ | ------------- | ------------------------- |
+| 1      | 16,613          | 181.0            | 407.1 / 397.4                        | 0.33 / 1.43        | 2.46          | monokernel                |
+| 2      | 20,580          | 213.6            | 394.6 / 304.6                        | 0.30 / 0.89        | 2.53          | monokernel                |
+| 4      | 25,223          | 283.2            | 322.5 / 231.1                        | 0.29 / 0.74        | 3.10          | monokernel                |
+| 8      | 41,098          | 402.3            | 270.8 / 163.7                        | 0.32 / 0.84        | 3.69          | monokernel, 1 draft token |
+| 12     | 59,126          | 540.0            | 142.7 / 99.8                         | 0.39 / 0.98        | 7.01          | ReplaySSM                 |
+| 16     | 77,097          | 678.1            | 122.4 / 72.1                         | 0.45 / 1.10        | 8.17          | ReplaySSM                 |
+
 
 *Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
 
@@ -43,22 +43,28 @@ For inference, five properties matter:
 - **Per-layer embeddings (PLE).** A large n-gram embedding table feeds the model's PLE layer (layer 1 in this checkpoint). It is read sparsely, which makes it a good candidate for host memory.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding (SGLang `NEXTN`), verified by the target in one forward pass.
 
+
+
 ### The checkpoint: MXFP4 experts with AMD Quark
 
-The model is served in a quantized form that fits on one GPU. We serve [`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8), produced with AMD Quark:
+The model is served in a quantized form that fits on one GPU. We serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`, produced with AMD Quark:
 
-| Component | Format |
-|---|---|
+
+| Component                             | Format                                            |
+| ------------------------------------- | ------------------------------------------------- |
 | Routed experts (target and MTP draft) | OCP MXFP4 (FP4 with one E8M0 scale per 32 values) |
-| Attention projections | FP8, per-channel scales |
-| PLE embedding table | FP8 (`float8_e4m3fn`) |
-| Router, norms, LM head | High precision |
+| Attention projections                 | FP8, per-channel scales                           |
+| PLE embedding table                   | FP8 (`float8_e4m3fn`)                             |
+| Router, norms, LM head                | High precision                                    |
+
 
 The whole checkpoint is about 116 GiB, so it fits on one MI355X (288 GB HBM3E) with room for a large KV cache. That makes **TP1** the natural deployment: no tensor-parallel all-reduce in the decode path, and eight independent replicas per 8-GPU node.
 
 The MTP draft is quantized like the target, so the draft's MoE runs on the same MXFP4 kernels.
 
 ## Kernel and runtime optimizations on MI355X
+
+
 
 ### Memory: the PLE table on the host
 
@@ -99,6 +105,8 @@ From 12 agents up, the working set is many long, mostly shared prompts, so we ch
 - **HiCache** at 48 and 80 agents (`--enable-hierarchical-cache --hicache-size 298 --hicache-io-backend kernel --hicache-mem-layout page_first --hicache-write-policy write_back`): the KV cache spills to about 298 GB of host DRAM per replica, and admission goes up to 128 requests. At 80 agents we also cache only the prompt on finish (`--strip-thinking-cache`, since the AgentX replay never re-sends model output) and keep at most two Mamba states per conversation path (`--mamba-max-states-per-path 2`).
 - **Breakable prefill CUDA graphs** (`--cuda-graph-backend-prefill breakable`) capture the GDN prefill on static per-bucket tables; a batch outside the captured buckets runs eagerly through the AITER fused prefill.
 
+
+
 ### Agentic serving configuration
 
 Agent workloads use 16k prefill chunks, page size 64, BF16 Mamba/GDN state, six tokenizer workers, AITER unified attention, streaming every 50 tokens, and the Qwen3 reasoning and Qwen3-Coder tool-call parsers. Admission and the decode CUDA-graph batch equal the number of agents at 1–2 users (monokernel) and twice the number of agents at 12–24 users, so bursts stay inside a captured graph; at 48 and 80 agents both are 128. Every point uses `--mem-fraction-static` as given (`SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1`) instead of the AITER backend's default 0.85 scaling for long contexts, which gives a 3.45M-token pool instead of 2.78M at 12–16 users.
@@ -116,7 +124,7 @@ docker run -it --device /dev/dri --device /dev/kfd \
   lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261117
 ```
 
-**[TODO: until the open PRs land, the image needs seven SGLang source patches (sglang#48648, #45196, #48649, #45529, #41879, #44103, #48090), kept in the InferenceX recipe ([InferenceX#4832](https://github.com/SemiAnalysisAI/InferenceX/pull/4832), `qwen3.8next/sglang/mi355x-fp4-mtp/patches/`, applied by `qwen3.8next-rocm10-patches.sh`; AITER is not touched). Decide whether to point readers there or wait for a release image. Recipes 1–3 run without the patches too, with the kernels they add left off.]**
+**[TODO: until the open PRs land, the image needs seven SGLang source patches (sglang#48648, #45196, #48649, #45529, #41879, #44103, #48090), kept in the InferenceX recipe ([InferenceX#4832](https://github.com/SemiAnalysisAI/InferenceX/pull/4832),** `qwen3.8next/sglang/mi355x-fp4-mtp/patches/`**, applied by** `qwen3.8next-rocm10-patches.sh`**; AITER is not touched). Decide whether to point readers there or wait for a release image. Recipes 1–3 run without the patches too, with the kernels they add left off.]**
 
 **Recipe 1: 1–8 concurrent users (monokernel).** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to the number of users (up to 8). Keep NEXTN at 3 steps and 4 draft tokens: the monokernel serves only that shape. ReplaySSM, the PLE offload and the FP8 KV cache stay off.
 
@@ -166,6 +174,8 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
   "max_tokens": 200, "temperature": 0}'
 ```
 
+
+
 ## Accuracy
 
 GSM8K, full 1,319-question test set, served with recipe 2 at 16 concurrent requests and real MTP verification: **0.973 strict match** (±0.004). The fused QSA decode kernel is within noise of the Triton path on GSM8K (short prompts 95.2% vs 96.0%; ~23k-token prompts 95.8% vs 97.9%) and closer to an fp64 reference (relative L2 error 1.7e-3 vs 4–6e-3).
@@ -176,16 +186,18 @@ The newer changes were each checked on GSM8K with real MTP verification in their
 
 Everything in this post runs on the public `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261117` image, plus the SGLang source patches described above. The AMD pieces of that stack:
 
-| Component | Version in the image | Role for Qwen3.8-Flash-Next |
-|---|---|---|
-| [ROCm](https://rocm.docs.amd.com/) | 10.0.0 | GPU runtime and compiler for MI355X (gfx950) |
-| PyTorch | 2.11.0+rocm10.0.0 | tensors, CUDA-graph capture and the eager fallback paths |
-| Triton | 3.8.0 (ROCm build) | SGLang's remaining Triton kernels, such as the QSA bookkeeping and the dense sampling fallback |
-| [AITER](https://github.com/ROCm/aiter) | 0.1.29.dev156 (`581579ab`, 2026-11-07) | MXFP4 MoE, FP8 and BF16 GEMMs with tuned gfx950 tables, unified attention, top-k gating, and the FlyDSL kernels for GDN, QSA and hyper-connections |
-| [FlyDSL](https://github.com/ROCm/FlyDSL) | 0.4.2 | the kernel language behind the fused GDN, QSA and hyper-connection kernels and the monokernel |
-| [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) | `a04ceab` (2026-11-16) | the Qwen3.8-Flash-Next monokernel for MTP target verify and draft steps |
-| [SGLang](https://github.com/sgl-project/sglang) | 0.5.23.dev20261117 (`c67db7c762`) | serving: scheduler, speculative decoding (NEXTN), ReplaySSM, radix cache and HiCache |
-| [AMD Quark](https://quark.docs.amd.com/) | used offline | quantizes the checkpoint to MXFP4 experts, FP8 attention and an FP8 PLE table |
+
+| Component                                                   | Version in the image                   | Role for Qwen3.8-Flash-Next                                                                                                                        |
+| ----------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [ROCm](https://rocm.docs.amd.com/)                          | 10.0.0                                 | GPU runtime and compiler for MI355X (gfx950)                                                                                                       |
+| PyTorch                                                     | 2.11.0+rocm10.0.0                      | tensors, CUDA-graph capture and the eager fallback paths                                                                                           |
+| Triton                                                      | 3.8.0 (ROCm build)                     | SGLang's remaining Triton kernels, such as the QSA bookkeeping and the dense sampling fallback                                                     |
+| [AITER](https://github.com/ROCm/aiter)                      | 0.1.29.dev156 (`581579ab`, 2026-11-07) | MXFP4 MoE, FP8 and BF16 GEMMs with tuned gfx950 tables, unified attention, top-k gating, and the FlyDSL kernels for GDN, QSA and hyper-connections |
+| [FlyDSL](https://github.com/ROCm/FlyDSL)                    | 0.4.2                                  | the kernel language behind the fused GDN, QSA and hyper-connection kernels and the monokernel                                                      |
+| [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) | `a04ceab` (2026-11-16)                 | the Qwen3.8-Flash-Next monokernel for MTP target verify and draft steps                                                                            |
+| [SGLang](https://github.com/sgl-project/sglang)             | 0.5.23.dev20261117 (`c67db7c762`)      | serving: scheduler, speculative decoding (NEXTN), ReplaySSM, radix cache and HiCache                                                               |
+| [AMD Quark](https://quark.docs.amd.com/)                    | used offline                           | quantizes the checkpoint to MXFP4 experts, FP8 attention and an FP8 PLE table                                                                      |
+
 
 Two things in this stack are worth knowing when you reproduce the results:
 
@@ -204,19 +216,21 @@ We thank the Qwen team, the SGLang community, and the AMD AITER, FlyDSL, Quark, 
 
 ## Appendix: environment variables
 
-| Variable | Set to | Description |
-|---|---|---|
-| `SGLANG_USE_AITER` | 1 | AITER kernels for MoE, attention and GEMMs; also turns on the fused QSA sparse decode and the top-k MTP verify sampling on gfx950 |
-| `SGLANG_USE_AITER_UNIFIED_ATTN` | 1 (12+ users) | AITER unified attention |
-| `AITER_GDR_FLYDSL` | 1 | FlyDSL kernels for the GDN recurrence (decode and MTP verify) |
-| `SGLANG_ENABLE_SPEC_V2` | 1 | SGLang's v2 speculative-decoding scheduler |
-| `SGLANG_AITER_GDN_CONV` | 1 | FlyDSL causal conv1d for GDN prefill (sglang#41879) |
-| `SGLANG_AITER_GDN_PREFILL` | 1 (12+ users) | AITER GDN chunked prefill (sglang#44103) |
-| `SGLANG_AITER_GDN_PREFILL_H` | `fused` (12+ users) | single-launch fused FlyDSL GDN prefill; needs `--mamba-ssm-dtype bfloat16` |
-| `SGLANG_ROCM_OPT_QWEN4_FUSED_HC` | 1 (12+ users) | fused hyper-connection norm, mix and inject at decode (sglang#48648) |
-| `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION` | 1 | use `--mem-fraction-static` as given instead of the 0.85 long-context scaling |
 
-The monokernel has no environment variable: pass `--enable-amd-monokernel`. **[TODO: sglang#44103 is being reworked into the `--linear-attn-prefill-backend flydsl_fused` backend, so the two GDN prefill variables above will change; the recipe branch still sets `SGLANG_OPT_QWEN4_FUSED_HC`, the name before the review rename.]**
+| Variable                                   | Set to              | Description                                                                                                                       |
+| ------------------------------------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `SGLANG_USE_AITER`                         | 1                   | AITER kernels for MoE, attention and GEMMs; also turns on the fused QSA sparse decode and the top-k MTP verify sampling on gfx950 |
+| `SGLANG_USE_AITER_UNIFIED_ATTN`            | 1 (12+ users)       | AITER unified attention                                                                                                           |
+| `AITER_GDR_FLYDSL`                         | 1                   | FlyDSL kernels for the GDN recurrence (decode and MTP verify)                                                                     |
+| `SGLANG_ENABLE_SPEC_V2`                    | 1                   | SGLang's v2 speculative-decoding scheduler                                                                                        |
+| `SGLANG_AITER_GDN_CONV`                    | 1                   | FlyDSL causal conv1d for GDN prefill (sglang#41879)                                                                               |
+| `SGLANG_AITER_GDN_PREFILL`                 | 1 (12+ users)       | AITER GDN chunked prefill (sglang#44103)                                                                                          |
+| `SGLANG_AITER_GDN_PREFILL_H`               | `fused` (12+ users) | single-launch fused FlyDSL GDN prefill; needs `--mamba-ssm-dtype bfloat16`                                                        |
+| `SGLANG_ROCM_OPT_QWEN4_FUSED_HC`           | 1 (12+ users)       | fused hyper-connection norm, mix and inject at decode (sglang#48648)                                                              |
+| `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION` | 1                   | use `--mem-fraction-static` as given instead of the 0.85 long-context scaling                                                     |
+
+
+The monokernel has no environment variable: pass `--enable-amd-monokernel`. **[TODO: sglang#44103 is being reworked into the** `--linear-attn-prefill-backend flydsl_fused` **backend, so the two GDN prefill variables above will change; the recipe branch still sets** `SGLANG_OPT_QWEN4_FUSED_HC`**, the name before the review rename.]**
 
 #### Article by
 
