@@ -12,15 +12,14 @@ This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs 
 
 ## Performance
 
-InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1). The last column names the decode path; the monokernel and ReplaySSM are explained in [Kernel and runtime optimizations](#kernel-and-runtime-optimizations-on-mi355x).
+We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As shown in Figure 1, [the overall configurations of the run, including concurrency list as ...] and [AgentX configurations, like including how many requests, benchmark time duration as 3600s]. [Analysis of the overall trend]. 
+
 // screenshot from InferenceX
 *Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
 
-These rows were measured on 2026-10-28 with the image and patch set of that date (see Test configuration). The 8-agent row used one draft token per step; the monokernel in the current image accepts only 3 draft steps, so that point needs a re-run. **[TODO: replace the table with the current recipe's results at 1, 2, 12, 24, 48 and 80 agents.]**
+[Analysis of the high concurrency scenario, with the optimizations, i.e., kernel fusion, xxx, (summary from our optimizations including the major software stacks)]. [Analysis of the low concurrency scenario: with monokernel, xxx]. We are going to give more details about the optimizations in the latter sections.
 
-Following the InferenceX AgentX rules, speculative decoding in these runs uses a fixed, committed acceptance length for this model (2.32 tokens per step at 3 draft steps, 1.65 at 1 step) so that results are comparable across submissions; accuracy is measured separately with real verification.
-
-**[TODO: optionally a "what's coming" row. In October the full patch set, including the PRs still in review, reached 81,208 tok/s/GPU at 151.4 tok/s/user p50 at 16 agents; re-measure it on the current stack.]**
+**NOTE:** Until the day Nov 19, 2026, we wrote the blog, the performance submission shown in the figure depends on 7 PRs [PR links] that awaits to be merged to the SGLang main branch.
 
 ## Qwen3.8-Flash-Next at a glance
 
