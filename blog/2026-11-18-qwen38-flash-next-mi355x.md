@@ -15,6 +15,7 @@ This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs 
 We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As shown in Figure 1, [the overall configurations of the run, including concurrency list as ...] and [AgentX configurations, like including how many requests, benchmark time duration as 3600s]. [Analysis of the overall trend]. 
 
 // screenshot from InferenceX
+
 *Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
 
 [Analysis of the high concurrency scenario, with the optimizations, i.e., kernel fusion, xxx, (summary from our optimizations including the major software stacks)]. [Analysis of the low concurrency scenario: with monokernel, xxx]. We are going to give more details about the optimizations in the latter sections.
