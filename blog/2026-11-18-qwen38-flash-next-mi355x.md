@@ -49,12 +49,16 @@ The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355
 
 // performance gain
 
+// Write the difference of implementation with Triton
+
 ### Hyper Connections
 // analysis
 
 // key change(s)
 
 // performance gain
+
+// Write the difference of implementation with Triton
 
 
 ### GDN
@@ -64,6 +68,8 @@ The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355
 
 // performance gain
 
+// Write the difference of implementation with Triton
+
 
 ### Monokernel
 // analysis
@@ -71,6 +77,11 @@ The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355
 // key change(s)
 
 // performance gain
+
+//How much layers we cover by one call, why do we split this way.
+
+### Hyperparameters tuning
+//what the difference of the amd parameters and nv
 
 ### Optimization Automation
 // key idea
