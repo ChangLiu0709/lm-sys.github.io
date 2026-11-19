@@ -8,12 +8,6 @@ type: blog
 
 *Draft, 2026-11-18. The technical sections (kernel and runtime optimizations, how to run, environment variables, test configuration) were refreshed against the `20261117` image and the current patch set. The numbers in Performance and Accuracy are from 2026-10-28 and still need to be re-measured. Items marked **[TODO]** need a measurement or a decision before publication.*
 
-## TL;DR
-
-**[TODO: rewrite once the Performance numbers are re-measured.]**
-
-## Introduction
-
 Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. Its architecture combines three ideas that each need their own kernels: linear attention through Gated DeltaNet for most layers, a learned sparse attention (QSA) for the rest, and hyper-connections that carry four copies of the hidden state between layers. Agentic coding adds a fourth requirement: very long, mostly shared prompts (tens to hundreds of thousands of tokens) with short, latency-sensitive replies.
 
 This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with the measured performance on the InferenceX AgentX benchmark, then cover the model, the quantized checkpoint, the kernels we wrote or tuned in AITER and FlyDSL, the FlyDSL monokernel for speculative decoding at low concurrency, and a serving recipe.
