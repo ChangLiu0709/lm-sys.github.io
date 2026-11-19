@@ -13,18 +13,7 @@ This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs 
 ## Performance
 
 InferenceX AgentX agentic-coding benchmark: AIPerf replays recorded coding-agent sessions (mean input about 86k tokens, p90 about 218k) for one hour per point, on one MI355X (TP1). The last column names the decode path; the monokernel and ReplaySSM are explained in [Kernel and runtime optimizations](#kernel-and-runtime-optimizations-on-mi355x).
-
-
-| Agents | Total tok/s/GPU | Output tok/s/GPU | Interactivity p50 / p90 (tok/s/user) | TTFT p50 / p90 (s) | TPOT p50 (ms) | Decode path               |
-| ------ | --------------- | ---------------- | ------------------------------------ | ------------------ | ------------- | ------------------------- |
-| 1      | 16,613          | 181.0            | 407.1 / 397.4                        | 0.33 / 1.43        | 2.46          | monokernel                |
-| 2      | 20,580          | 213.6            | 394.6 / 304.6                        | 0.30 / 0.89        | 2.53          | monokernel                |
-| 4      | 25,223          | 283.2            | 322.5 / 231.1                        | 0.29 / 0.74        | 3.10          | monokernel                |
-| 8      | 41,098          | 402.3            | 270.8 / 163.7                        | 0.32 / 0.84        | 3.69          | monokernel, 1 draft token |
-| 12     | 59,126          | 540.0            | 142.7 / 99.8                         | 0.39 / 0.98        | 7.01          | ReplaySSM                 |
-| 16     | 77,097          | 678.1            | 122.4 / 72.1                         | 0.45 / 1.10        | 8.17          | ReplaySSM                 |
-
-
+// screenshot from InferenceX
 *Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
 
 These rows were measured on 2026-10-28 with the image and patch set of that date (see Test configuration). The 8-agent row used one draft token per step; the monokernel in the current image accepts only 3 draft steps, so that point needs a re-run. **[TODO: replace the table with the current recipe's results at 1, 2, 12, 24, 48 and 80 agents.]**
