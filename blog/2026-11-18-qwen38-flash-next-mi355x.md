@@ -6,9 +6,9 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. Its architecture combines three ideas that each need their own kernels: linear attention through Gated DeltaNet for most layers, a learned sparse attention (QSA) for the rest, and hyper-connections that carry four copies of the hidden state between layers. Agentic coding adds a fourth requirement: very long, mostly shared prompts (tens to hundreds of thousands of tokens) with short, latency-sensitive replies.
+Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. [One sentence for its community impact, and the reason binding to its model architecture, features, dataset(if involved), etc]. Thus, enablement and performance optimization of Qwen3.8-Flash-Next on MI355X is important. In our blog, we show how to optimize the inference of Qwen3.8-Flash-Next by ... We benchmark the inference performance on InferenceX AgentX, which [one sentence to introduce the dataset and benchmark metrics], outperforming our competitor NVIDIA B200 and B300 across all concurrency levels.
 
-This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with the measured performance on the InferenceX AgentX benchmark, then cover the model, the quantized checkpoint, the kernels we wrote or tuned in AITER and FlyDSL, the FlyDSL monokernel for speculative decoding at low concurrency, and a serving recipe.
+This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with our latest performance result on InferenceX AgentX, then reveal the optimization behind the scene by briefly introducing the Qwen model architecure, the key optimizations, and the ideas of using AI agent to automate the process. All the results can be reproduced by referring to the command on SGLang cookbook [link].
 
 ## Performance
 
