@@ -6,9 +6,9 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. [One sentence for its community impact, and the reason binding to its model architecture, features, dataset(if involved), etc]. Thus, enablement and performance optimization of Qwen3.8-Flash-Next on MI355X is important. In our blog, we show how to optimize the inference of Qwen3.8-Flash-Next by ... We benchmark the inference performance on InferenceX AgentX, which [one sentence to introduce the dataset and benchmark metrics], outperforming our competitor NVIDIA B200 and B300 across all concurrency levels.
+Qwen3.8-Flash-Next is the Qwen team's first open-weight release of the architecture that will underpin Qwen4: a 125B-parameter Mixture-of-Experts model that activates only 6B parameters per token, plus a 51B-parameter n-gram embedding table and a 4B multi-token-prediction (MTP) layer, with a native context of 262,144 tokens (extensible to 1M). It combines Gated DeltaNet linear attention with Qwen Sparse Attention (QSA), a block-level sparse attention that cuts long-context latency, and a Gated Residual that widens the residual stream into four branches. These choices target long-context agentic workloads, which increasingly dominate real-world usage, and its open weights, compatible with Hugging Face Transformers, vLLM and SGLang, give the community an early look at where the Qwen family is heading. Each of these features needs dedicated kernels and runtime support, so enabling and optimizing Qwen3.8-Flash-Next on AMD Instinct™ MI355X GPUs is important. In this blog, we show how to optimize its inference with fused FlyDSL kernels for QSA, the Gated Residual and Gated DeltaNet, a persistent monokernel for low-concurrency speculative decoding, and AI agents that automate part of the tuning. We benchmark the inference performance on InferenceX AgentX, which replays recorded coding-agent sessions (mean input of about 86k tokens) for one hour per concurrency level and reports throughput per GPU against per-user interactivity (tokens/s/user), and MI355X outperforms NVIDIA B200 and B300 across all concurrency levels.
 
-This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with our latest performance result on InferenceX AgentX, then reveal the optimization behind the scene by briefly introducing the Qwen model architecure, the key optimizations, and the ideas of using AI agent to automate the process. All the results can be reproduced by referring to the command on SGLang cookbook [link].
+This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with our latest performance results on InferenceX AgentX, then explain the optimizations behind them: the Qwen3.8-Flash-Next architecture, the key kernel optimizations, and how we use AI agents to automate part of the process. All results can be reproduced with the commands in the SGLang cookbook [link].
 
 ## Performance
 
@@ -18,31 +18,31 @@ We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As
 
 *Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
 
-[Analysis of the high concurrency scenario, with the optimizations, i.e., kernel fusion, xxx, (summary from our optimizations including the major software stacks)]. [Analysis of the low concurrency scenario: with monokernel, xxx]. We are going to give more details about the optimizations in the latter sections.
+[Analysis of the high concurrency scenario, with the optimizations, i.e., kernel fusion, xxx, (summary from our optimizations including the major software stacks)]. [Analysis of the low concurrency scenario: with monokernel, xxx]. We give more details about these optimizations in the later sections.
 
-**NOTE:** Until the day Nov 19, 2026, we wrote the blog, the performance submission shown in the figure depends on 7 PRs [PR links] that awaits to be merged to the SGLang main branch.
+**NOTE:** As of November 19, 2026, the date of writing, the results shown in the figure depend on 7 PRs [PR links] that are awaiting merge into the SGLang main branch.
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its inference, these properties of the model architecture matter:
+The architecture of Qwen3.8-Flash-Next is shown in Figure 2. Several of its properties matter for inference:
 
-- **Gated Delta Net.** 36 of the 48 layers use Gated Delta Net, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context.
-- **Query Sparse Attention.** The other 12 use Query Sparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
-- **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
-- **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
+- **Gated DeltaNet.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context.
+- **Qwen Sparse Attention (QSA).** The other 12 use Qwen Sparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
+- **Hyper-connections (Gated Residual).** Instead of one residual stream, the model keeps four streams of width 2,560. Before every block, a gated mix collapses them into one input. It is small, but it runs in every layer at every step.
+- **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, which the target model verifies in one forward pass.
 
 // diagram of Qwen3.8 Flash Next model architecture
 
 ### The checkpoint: MXFP4 experts with AMD Quark
 
-On AMD MI GPUs, we quantized the Qwen3.8 Flash Next model weights using AMD Quark, which is [one sentence of Quark].
-Then [the model can be served in a quantized form which runs more efficiently and reduce the comsuption of GPU memory]. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`.
+For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next weights with AMD Quark, which is [one sentence of Quark].
+Then [the model can be served in a quantized form which runs more efficiently and reduces GPU memory consumption]. In our experiments, we serve [`amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8`](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8).
 
-The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355X (288 GB HBM3E) with room for a large KV cache, which makes ... [once sentence: serving more efficient]. The MTP draft model is also quantized like the way we quantized the target model, so the draft's MoE runs on the same MXFP4 kernels.
+The whole checkpoint is about 116 GiB, so it fits on a single MI355X (288 GB HBM3E) with room left for a large KV cache, which makes ... [one sentence: serving more efficient]. The MTP draft model is quantized in the same way as the target model, so the draft's MoE runs on the same MXFP4 kernels.
 
 ## Kernel Optimization
 
-### QSA - Query Sparse Attention
+### QSA - Qwen Sparse Attention
 // analysis
 
 // key change(s)
