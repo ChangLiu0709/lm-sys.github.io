@@ -26,7 +26,8 @@ We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As
 
 The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its inference, these properties of the model architecture matter:
 
-- **Hybrid attention.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context. The other 12 use QuerySparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
+- **Gated Delta Net.** 36 of the 48 layers use Gated Delta Net, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context.
+- **Query Sparse Attention.** The other 12 use Query Sparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
 
@@ -41,7 +42,7 @@ The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355
 
 ## Kernel Optimization
 
-### QSA - Qwen Sparse Attention
+### QSA - Query Sparse Attention
 // analysis
 
 // key change(s)
