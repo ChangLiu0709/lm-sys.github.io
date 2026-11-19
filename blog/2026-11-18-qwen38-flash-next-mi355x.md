@@ -21,22 +21,22 @@ We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As
 
 **NOTE:** Until the day Nov 19, 2026, we wrote the blog, the performance submission shown in the figure depends on 7 PRs [PR links] that awaits to be merged to the SGLang main branch.
 
-## Qwen3.8-Flash-Next at a glance
+## Qwen3.8-Flash-Next Model Architecture
 
-For inference, five properties matter:
+For Qwen3.8-Flash-Next inference, five properties matter:
 
-- **Hybrid attention.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context. The other 12 use QuerySparse Attention: each query attends to a learned selection of at most 2,051 past positions (512 compressed blocks of 4, plus 3), with 24 query heads sharing 2 KV heads of dimension 256.
-- **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix (a 10,240 → 320 → 10,240 low-rank gate) collapses them into one input. It is small but runs in every layer at every step.
-- **Sparse MoE.** Every layer is a sparse MoE: 512 routed experts with a softmax router, 10 routed experts active per token, plus one shared expert (fused into the routed MXFP4 experts as expert 512). **[TODO: total and active parameter counts.]**
-- **Per-layer embeddings (PLE).** A large n-gram embedding table feeds the model's PLE layer (layer 1 in this checkpoint). It is read sparsely, which makes it a good candidate for host memory.
-- **Native MTP.** A built-in draft layer proposes tokens for speculative decoding (SGLang `NEXTN`), verified by the target in one forward pass.
+- **Hybrid attention.** 36 of the 48 layers use Gated DeltaNet, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context. The other 12 use QuerySparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
+- **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
+- **Sparse MoE.** Every layer is a sparse MoE: 512 routed experts with a softmax router, 10 routed experts active per token, plus one shared expert.
+- **Per-layer embeddings (PLE).** A large n-gram embedding table feeds the model's PLE layer. It is read sparsely, which makes it a good candidate for host memory.
+- **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
 
-
+// diagram of Qwen3.8 Flash Next model architecture
 
 ### The checkpoint: MXFP4 experts with AMD Quark
 
-The model is served in a quantized form that fits on one GPU. We serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`, produced with AMD Quark:
-
+On AMD MI GPUs, we quantized the Qwen3.8 Flash Next model weights using AMD Quark, which is [one sentence of Quark].
+Then [the model can be served in a quantized form which runs more efficiently and reduce the comsuption of GPU memory]. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`:
 
 | Component                             | Format                                            |
 | ------------------------------------- | ------------------------------------------------- |
@@ -45,10 +45,7 @@ The model is served in a quantized form that fits on one GPU. We serve `[amd/Qwe
 | PLE embedding table                   | FP8 (`float8_e4m3fn`)                             |
 | Router, norms, LM head                | High precision                                    |
 
-
-The whole checkpoint is about 116 GiB, so it fits on one MI355X (288 GB HBM3E) with room for a large KV cache. That makes **TP1** the natural deployment: no tensor-parallel all-reduce in the decode path, and eight independent replicas per 8-GPU node.
-
-The MTP draft is quantized like the target, so the draft's MoE runs on the same MXFP4 kernels.
+The whole checkpoint is about 116 GiB, so it reduced the comsuption on one MI355X (288 GB HBM3E) with room for a large KV cache, which makes ... [once sentence: serving more efficient]. The MTP draft model is also quantized like the way we quantized the target model, so the draft's MoE runs on the same MXFP4 kernels.
 
 ## Kernel and runtime optimizations on MI355X
 
