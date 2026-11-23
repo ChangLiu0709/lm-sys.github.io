@@ -590,6 +590,7 @@ As we saw in figure 2, the basic building block for Qwen3.8-Flash-Next is 3x GDN
 
 Figure 4 shows a full decode step with the monokernel on. With this we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
 
+For more details, the monokernel source code is available on [GitHub](https://github.com/sgl-project/sgl-amd-mono/tree/main/sgl_amd_mono/qwen38_flash_next).
 
 ## Conclusion
 
