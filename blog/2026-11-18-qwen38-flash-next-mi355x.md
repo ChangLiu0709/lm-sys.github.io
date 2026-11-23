@@ -31,7 +31,8 @@ The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its infer
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
 
-// diagram of Qwen3.8 Flash Next model architecture
+![Qwen3.8-Flash-Next Model Architecture](/images/blog/qwen38-flash-next-mi355x/architecture.png)
+*Figure 2: Qwen3.8-Flash-Next model architecture*
 
 ### The checkpoint: MXFP4 experts with AMD Quark
 
@@ -572,21 +573,22 @@ did not change.
 
 
 ### Monokernel
-// analysis
 
-// key change(s)
+When we first benchmarked this model on AMD MI355X we quickly realized that the low concurrency region (i.e., <= 8) was going to be the most critical for us in terms of performance.
 
-// performance gain
+![Traces before monokernel](/images/blog/qwen38-flash-next-mi355x/before_mono.png)
+*Figure 3: Kernel trace of a full decode step at concurrency 1 without monokernel*
 
-//How much layers we cover by one call, why do we split this way.
+Figure 3 shows the full trace of one decode step at concurrency 1. As you can see, it takes roughly 14ms for a total of over **1600 individual kernel launches**.
+Launching a lot of kernels is not necessarily a problem as HIP graphs can get rid of kernel launch overheads but in this case it actually is. The issues is that these kernels are all very small so the GPU is not doing useful work but mostly loading data from and to HBM memory. In this scenario, the most practical optimization strategy is simply trying to reduce as much as possible the HBM traffic, this means fusing multiple operations together.
 
-### Hyperparameters tuning
-//what the difference of the amd parameters and nv
+In order to achieve the best possible performance at low concurrency, we decided to fuse as many kernels as possible into a single (mono) kernel.
+As we saw in figure 2, the basic building block for Qwen3.8-Flash-Next is 3x GDN layers followed by a QSA layer, repeated 12 times for a total of 48 hidden layers. We implemented a specialized FlyDSL kernel that replaces this basic building block with a **single kernel launch**.
 
-### Optimization Automation
-// key idea
+![Traces with monokernel](/images/blog/qwen38-flash-next-mi355x/after_mono.png)
+*Figure 4: Kernel trace of a full decode step at concurrency 1 with the new FlyDSL monokernel*
 
-// ...
+Figure 4 shows a full decode step with the monokernel on. With this we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
 
 
 ## Conclusion
