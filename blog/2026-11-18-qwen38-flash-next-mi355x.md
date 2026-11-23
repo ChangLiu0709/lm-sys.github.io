@@ -90,7 +90,7 @@ The code below is taken from these PRs. Lines marked `...` are left out.
 A few terms first:
 
 - **CU** (compute unit) is the basic execution block of the GPU. MI355X has
-  **256 CUs**, many more than the GPUs the original kernels were sized for.
+  **256 CUs**.
 - **Workgroup (WG)** is the AMD name for a thread block. One WG always runs on
   one CU.
 - **Grid** is the set of all WGs that one kernel launch creates. When you call
@@ -231,49 +231,6 @@ round 1   [ 64..79 ] [ 80..95 ] [ 96..111] [112..127 ]
 round 2   [128..143] [144..159] [160..175] [176..191 ]
 ```
 
-#### How `num_splits` is chosen
-
-It is computed from the CU count at run time, not hard-coded:
-
-```python
-# aiter/ops/flydsl/kernels/qsa/sparse_decode_attn.py
-# A KV split always covers whole wave rounds of 16-token tiles.
-SPLIT_TOKEN_ALIGN = NUM_WAVES * TILE_TOKENS  # 4 waves x 16 tokens = 64
-
-# aiter/ops/flydsl/qsa_sparse_decode.py
-# Measured on MI355X (Hkv in {1, 2}, batch 1-128): one CTA per CU beats two, since
-# every extra split adds a prologue and a partial to merge; and below two 16-token
-# tiles per wave the fixed per-CTA latency outweighs the extra parallelism.
-_CTAS_PER_CU = 1
-_MIN_TOKENS_PER_SPLIT = 2 * SPLIT_TOKEN_ALIGN
-
-def _split_layout(topk: int, num_splits: int) -> tuple[int, int]:
-    """Tokens per split (whole wave rounds) and the split count that covers topk."""
-    per_split = -(-topk // max(1, num_splits))
-    per_split = -(-per_split // SPLIT_TOKEN_ALIGN) * SPLIT_TOKEN_ALIGN
-    return per_split, -(-topk // per_split)
-
-def recommended_num_splits(
-    num_rows: int, num_kv_heads: int, topk: int, device: torch.device
-) -> int:
-    """KV splits that fill the GPU at this batch; fixed per CUDA-graph batch size."""
-    _, num_cus = _device_info(torch.device(device).index or 0)
-    # (1) enough splits for one workgroup per CU
-    wanted = -(-(_CTAS_PER_CU * num_cus) // max(1, num_rows * num_kv_heads))
-    # (2) but no split shorter than 128 tokens
-    wanted = min(wanted, max(1, -(-topk // _MIN_TOKENS_PER_SPLIT)))
-    # (3) round each split up to whole 64-token rounds
-    return _split_layout(topk, wanted)[1]
-
-# the kernel launch: one workgroup per (row, KV head, split)
-sparse_decode_attn_kernel(...).launch(
-    grid=(num_rows, num_kv_heads, num_splits),
-    block=(BLOCK_THREADS, 1, 1),
-    stream=stream,
-)
-```
-
-(`-(-a // b)` is ceiling division.) Each of the three steps has a reason:
 
 | Step | Rule | Why |
 |---|---|---|
@@ -300,7 +257,7 @@ The same rule at other batch sizes (TP1, 2 KV heads):
 
 At 128 rows the old grid already fills the GPU, so nothing is split and the
 reduce kernel is skipped. The split count depends only on the batch size, so
-it is fixed for each captured graph batch size (see section 7).
+it is fixed for each captured graph batch size.
 
 #### Result
 
@@ -318,8 +275,9 @@ after (FlyDSL)                                                33 µs
 ```
 
 Split-KV is the reason the attention part dropped from 71.8 to 28.9 µs. The
-gather and helper kernels went away for a different reason (fusion, see
-section 2).
+gather and helper kernels went away for a different reason: the new kernel
+reads the selected positions straight from the KV pool (section 2.1), so the
+separate pass that compacted K and V into a temporary buffer in HBM is gone.
 
 The speedup is largest where the old grid was emptiest:
 
@@ -329,8 +287,8 @@ The speedup is largest where the old grid was emptiest:
 | 16 | 32 WGs | 25.3 µs | 112.4 µs | 4.4× |
 | 128 | 256 WGs | 100.9 µs | 344.4 µs | 3.4× |
 
-At batch 128 the grid was already full. The 3.4× there comes from the fusion
-and the MFMA rewrite (sections 2 and 3), not from the split.
+At batch 128 the grid was already full. The 3.4× there comes from the fused
+gather and the MFMA rewrite (section 2), not from the split.
 
 ### 1.2 Summary of section 1
 
@@ -342,57 +300,50 @@ change             move positions INTO the grid (rows × KV heads × splits)
 knob               num_splits from the CU count
 ```
 
-Compute the grid from the CU count at run time. Do not copy the grid from the
-original kernel (it was sized for a GPU with far fewer compute units), and do
-not hard-code it.
+The previous kernel sized its grid by the problem shape (rows × KV heads).
+With only 2 KV heads and few rows at decode, that shape is far smaller than
+256 CUs. Compute the grid from the CU count at run time instead, and do not
+hard-code it.
 
 ## 2. Rewrite the MMA part for MFMA, don't translate it
 
-### 2.0 The basic idea: two different matrix engines
+### 2.0 The basic idea: on MI355X every lane holds a piece of the tile
 
-The original kernels and MI355X both use matrix units, but in very different
-ways.
+On MI355X the matrix cores are driven by MFMA instructions:
 
-```
-original design: large-tile MMA + TMEM      MI355X (gfx950), MFMA
+- **Every wave (64 lanes) issues its own MFMA.** There is no instruction that
+  works on a whole workgroup tile.
+- **The tiles are small:** 16 × 16 (or 32 × 32) per wave. A large tile is many
+  MFMAs, and the kernel decides how to place them.
+- **Operands and accumulator live in registers.** Every lane holds a small,
+  fixed piece of A, B and C.
 
-  one thread issues one MMA                   every wave (64 lanes) issues
-  for the whole thread block                  its own MFMA
+So on MI355X the layout is the kernel's job: it must know which lane holds
+which element, and it pays for every accumulator in registers.
 
-  tile: 128 × N per block                     tile: 16 × 16 (or 32 × 32) per wave
-        (256 × N with a block pair)
+That is where the previous kernels went wrong. They were not written around
+the MFMA lane layout, and it showed in three ways:
 
-  operands:  shared memory (TMA puts          operands:  registers, every lane
-             them there)                                 holds a small piece
+| Previous kernel | What it assumed | Why that is slow on MI355X |
+|---|---|---|
+| QSA decode | P (the softmax output) can be fed to the next matrix product as the A operand; one large accumulator tile | The MFMA accumulator does not have the A layout, so P goes through LDS for every tile. A large accumulator eats the registers. |
+| GDN prefill | the triangular inverse is computed row by row (forward substitution) | 16 dependent vector steps per block, while the matrix cores sit idle |
+| HC GEMV | weights stored row-major, one row per output | each lane loads its fragment straight from HBM, and row-major scatters a wave's load over 300 KB |
 
-  accumulator: Tensor Memory (TMEM),          accumulator: registers, every lane
-             256 KB per core, NOT registers              holds a small piece
-```
+The register cost of a large accumulator is easy to underestimate. A
+128 × 256 fp32 accumulator, spread over a workgroup of 4 waves (256 lanes),
+takes 128 × 256 / 256 = **128 registers per lane**, before any operands,
+addresses or prefetch buffers. That leaves little room for anything else and
+lowers occupancy.
 
-What this means for a kernel:
-
-| | Original design | MI355X | Consequence |
-|---|---|---|---|
-| Who holds the data | the hardware (SMEM, TMEM) | each of the 64 lanes | You must know which lane holds which element |
-| Tile size | large (128 × N) | small (16 × 16) | A big tile is many MFMAs, and you choose how to place them |
-| Accumulator | TMEM, outside the register file | registers | A big accumulator takes registers away from everything else |
-
-The register cost is real. Take a 128 × 256 fp32 accumulator, a normal size
-when the kernel was designed around TMEM. On MI355X, spread over a workgroup of 4 waves (256 lanes), it takes
-128 × 256 / 256 = **128 registers per lane**, before any operands, addresses
-or prefetch buffers. In the original design the same accumulator sits in
-TMEM and costs no registers.
-
-So a tile layout or fragment mapping copied from the original kernel is wrong (the
-lanes hold other elements) or slow (it does not fit in registers, or it needs
-extra copies through LDS). You have to design the MMA part again. The rest of
-this section shows how we did it for three cases:
+So the MMA part has to be designed again from the MFMA layout. The rest of
+this section shows how we did it for the three cases:
 
 | | Kernel | Problem | Rewrite |
 |---|---|---|---|
-| 3.1 | QSA sparse decode | chain QKᵀ → softmax → PV without going through LDS | transpose the problem so the accumulator is the next operand |
-| 3.2 | GDN chunked prefill | triangular inverse is a serial loop | compute it with matrix products only |
-| 3.3 | HC GEMV | each lane loads its own fragment from HBM | store the weights in fragment order |
+| 2.1 | QSA sparse decode | chain QKᵀ → softmax → PV without going through LDS | transpose the problem so the accumulator is the next operand |
+| 2.2 | GDN chunked prefill | triangular inverse is a serial loop | compute it with matrix products only |
+| 2.3 | HC GEMV | each lane loads its own fragment from HBM | store the weights in fragment order |
 
 #### How one MFMA spreads over 64 lanes
 
@@ -421,11 +372,11 @@ so the accumulator does *not* match A.)
 The `16x16x32` variant used for QKᵀ looks the same but holds 8 values per
 lane, starting at `k = 8·(l // 16)`.
 
-With the MMA instructions FlashAttention-2 was written for it is the other way
-round: the accumulator has the layout of the **A** operand, so FA2 computes
-`S = Q·Kᵀ` with Q on M and passes P as A to `P·V`. If you copy that on
-MI355X, P lands in the wrong lanes, and you need an extra trip through LDS for
-every tile.
+The usual attention formulation (FlashAttention-2, and the previous QSA
+kernel) does the opposite: it computes `S = Q·Kᵀ` with Q on M and passes P as
+the **A** operand of `P·V`. On MFMA the accumulator does not have the A
+layout, so P lands in the wrong lanes, and it needs an extra trip through LDS
+for every tile.
 
 ### 2.1 QSA sparse decode: keep the softmax in registers
 
@@ -442,13 +393,16 @@ O += P · V        V: 16 tokens × 256                             O: 12 × 256
 Decode has only 1 query token, so the "query" side of the MMA is the 12 heads
 of the GQA group. That fits the 16-wide MFMA with 4 padding columns.
 
-#### Before: the original layout
+#### Before: why the previous layout was slow on MI355X
 
-The PR replaces a Triton KV gather plus a decode kernel that was built
-around large MMA tiles with the accumulator in TMEM. Moved
-to MFMA with FA2's layout (heads on M, P as the A operand), the P tile would
-have to be written to LDS and read back in another layout after every
-16-token tile.
+The PR replaces a Triton KV gather plus a decode kernel that used the
+FlashAttention-2 layout (heads on M, P as the A operand) with a large
+accumulator tile. On MI355X this costs twice:
+
+- After every 16-token tile, P has to be written to LDS and read back in the
+  A layout, with a barrier in between.
+- The large accumulator takes most of the registers, so there is no room
+  left to prefetch the next K/V tile (section 3.2).
 
 #### Change: put tokens on M and heads on N, so P is already a B operand
 
@@ -490,8 +444,8 @@ Why each choice was made:
   and would not match.
 - **V read transposed.** Step 3 needs Vᵀ as the A operand: each lane needs 4
   tokens of *one* dim, but V is stored by token. `ds_read_b64_tr_b16` reads a
-  64-bit piece from LDS and transposes it on the way, the gfx950 version of
-  a transposing shared-memory load.
+  64-bit piece from LDS and transposes it on the way (new in gfx950), so no
+  separate transpose pass is needed.
 
 The code, with the three steps marked:
 
@@ -540,14 +494,14 @@ factor; `m * 512` steps over 16 × 16 bf16 V sub-tiles.)
   between the softmax and PV.
 - The output accumulator is 16 tiles × 4 fp32 = **64 registers per lane**.
   That is small enough to leave room for the K/V prefetch buffers of
-  section 4. Q is kept in LDS (not registers) for the same reason.
+  section 3. Q is kept in LDS (not registers) for the same reason.
 - The cost: 4 of the 16 columns are padding (12 heads), so 25% of each MFMA
   is wasted. That is cheap, because decode is limited by memory, not by
   matrix throughput.
 
-FlashAttention does the same thing in the original kernels. The idea carries
-over, but the layout that makes it work is different, and you have to work it out again
-for MFMA.
+Keeping P in registers is the standard FlashAttention idea. What is specific
+to MI355X is the layout that makes it possible: with MFMA, P has to be the
+B operand, so the whole problem is transposed.
 
 ### 2.2 GDN prefill: replace a serial loop with matrix products
 
@@ -570,13 +524,14 @@ row 3   [ L30    | L31    | L32    | D3     ]
   step 2: fill the blocks below from them with matrix products
 ```
 
-#### Before: forward substitution
+#### Before: forward substitution, and why it is slow on MI355X
 
-The usual way to invert a triangular block (e.g. `solve_tril` in the FLA
-Triton kernels) is forward substitution: row `i` of the inverse needs all rows
-before it. For a 16 × 16 block that is **16 dependent steps** of small vector
-work. On MI355X this is bad: the matrix cores do nothing during the loop,
-and every step waits for the previous one.
+The previous path inverts each triangular block the usual way (e.g.
+`solve_tril` in the FLA Triton kernels): forward substitution, where row `i`
+of the inverse needs all rows before it. For a 16 × 16 block that is **16
+dependent steps** of small vector work. On MI355X almost all of the compute
+is in the matrix cores, and they do nothing during this loop, while every step
+waits for the previous one.
 
 #### Change: invert each diagonal block with 6 matrix products
 
@@ -636,13 +591,14 @@ For `mfma_f32_16x16x32_bf16`, one B fragment is a 16 (n) × 32 (k) piece of the
 weights. Lane `l` needs column `n = l % 16` and 8 values starting at
 `k = 8·(l // 16)`.
 
-#### Before: weights row-major (one row per output)
+#### Before: weights row-major, and why that is slow on MI355X
 
-The original kernel was built for TMA, which copies a whole tile into shared
-memory and handles the layout, so the layout in HBM hardly mattered. On MI355X
-there is no TMA. Each lane
-loads its own piece straight into registers, so the HBM layout decides the
-access pattern:
+The previous path keeps the weights row-major, one row per output, and runs a
+generic split-K GEMM on them. Row-major works when a kernel first stages a
+whole tile in LDS and rearranges it there. But a decode GEMV is limited by HBM
+bandwidth, and on MI355X the cheapest way to feed MFMA is to load each lane's
+fragment straight from HBM into registers with a buffer load. Then the HBM
+layout *is* the access pattern:
 
 ```
 row-major w[n][k] (k = 10,240 → row stride 20 KB)
@@ -690,24 +646,24 @@ fragment (next `k_tile`) is the next 1 KB.
 - The address is just `base + 16·lane + 1024·tile`, with no per-lane index
   math in the loop.
 - It costs nothing at run time: the packing is done once when the weights are
-  loaded, together with the RMSNorm folding from section 2.
+  loaded, together with folding the RMSNorm weight into them.
 
-### 2.4 Summary of section 3
+### 2.4 Summary of section 2
 
 ```
-                  original design                    MI355X rewrite
-QSA  QK → PV      S = Q·Kᵀ, P passed as A            Sᵀ = K·Qᵀ, Pᵀ passed as B
-                  (C layout = A layout on mma)       (C layout = B layout on MFMA)
-GDN  (I + A)⁻¹    forward substitution, serial       (I−A)(I+A²)(I+A⁴)(I+A⁸),
-                                                     6 split-bf16 matrix products
-HC   weights      row-major, TMA handles layout      packed in lane order,
-                                                     1 KB per fragment
+                  previous kernel → why slow on MI355X       MI355X rewrite
+QSA  QK → PV      S = Q·Kᵀ, P passed as A                    Sᵀ = K·Qᵀ, Pᵀ passed as B
+                  → MFMA C ≠ A layout, LDS round trip        (C layout = B layout on MFMA)
+GDN  (I + A)⁻¹    forward substitution                       (I−A)(I+A²)(I+A⁴)(I+A⁸),
+                  → serial, matrix cores idle                6 split-bf16 matrix products
+HC   weights      row-major                                  packed in lane order,
+                  → each wave load scattered over 300 KB     1 KB per fragment
 ```
 
 The rule in all three: start from the MFMA lane layout and choose the data
-placement to fit it. Do not start from the original kernel's tiles.
+placement to fit it. Do not start from the previous kernel's tiles.
 
-## 3. Replace TMA and `cp.async` pipelines with register prefetch
+## 3. Hide HBM latency with register prefetch
 
 ### 3.0 The basic idea: start the load early
 
@@ -724,27 +680,25 @@ prefetch         [load 0 ·····][load 1 ·····][load 2 ·····][load 
  ahead of time)                ▲ the wait for tile i+1 is hidden behind compute i
 ```
 
-The original kernels and ours both do this. They differ in **where the tile waits** between the
-load and its use, and **how the threads know it has arrived**.
+#### Why the previous kernels did not hide it
 
-**In the original design**, kernels use a multi-stage pipeline in shared
-memory. TMA
-or `cp.async` copies tiles from global memory straight into shared memory,
-without going through registers. An mbarrier per stage says when a stage is
-full (data arrived) or free (consumers are done):
+The previous paths did not have a place where this overlap could happen:
 
-```
-           producer (TMA)                         consumers (MMA threads)
-                │                                         ▲
-                ▼                                         │
-  shared mem: [ stage 0 ][ stage 1 ][ stage 2 ][ stage 3 ]   ring of stages
-              full/empty mbarrier per stage: the hardware signals "arrived"
-```
+- **GDN prefill** ran as 8 kernels per layer, and the state of each chunk was
+  written to HBM and read back by the next step. Every kernel started with a
+  cold load and nothing to compute while waiting for it.
+- **QSA decode** had no room for it: the accumulator took most of the
+  registers (section 2.1), so there were none left to hold the next tile.
 
-**On MI355X**, our kernels use the **register file as the staging buffer**.
-Every thread issues buffer loads for a tile that will be used *later*. The
-values travel through the loop in registers. When their turn comes they are
-written to LDS, the workgroup synchronizes, and the MFMAs read the tile:
+On MI355X the loads are issued by the threads themselves, so the kernel has
+to make room for the overlap explicitly.
+
+#### How we prefetch on MI355X
+
+Our kernels use the **register file as the staging buffer**. Every thread
+issues buffer loads for a tile that will be used *later*. The values travel
+through the loop in registers. When their turn comes they are written to LDS,
+the workgroup synchronizes, and the MFMAs read the tile:
 
 ```
 iteration i:   HBM ──buffer load──► registers          (tile i+d, arrives later)
@@ -753,20 +707,20 @@ iteration i:   HBM ──buffer load──► registers          (tile i+d, arri
                LDS ──► MFMA
 ```
 
-| | Original design | MI355X (our kernels) |
-|---|---|---|
-| Copy engine | TMA / `cp.async`, global → shared directly | each thread's own buffer loads, global → registers |
-| Where the tile waits | shared memory stages | registers, carried through the loop |
-| "Data arrived" | mbarrier, set by hardware | `s_waitcnt` that the compiler puts before first use |
-| "Everyone can read it" | mbarrier phase | an ordinary workgroup barrier, **placed by you** |
-| Cost | shared memory per stage | registers per prefetched tile |
+| | How it works on MI355X |
+|---|---|
+| Who copies | each thread's own buffer loads, HBM → registers |
+| Where the tile waits | registers, carried through the loop |
+| "Data arrived" | `s_waitcnt` that the compiler puts before first use |
+| "Everyone can read it" | an ordinary workgroup barrier, **placed by you** |
+| Cost | registers per prefetched tile |
 
-The last two rows are what make this harder. Each prefetched tile uses
+The last two rows are what make this hard. Each prefetched tile uses
 registers, so you have to plan how many tiles to keep in flight. The
 barriers are not tied to the data, so you have to work out by hand where they
 are needed and where they are not.
 
-Sections 4.1 and 4.2 show the two loops. Section 4.3 shows a buffer-load
+Sections 3.1 and 3.2 show the two loops. Section 3.3 shows a buffer-load
 feature that removes masks.
 
 ### 3.1 GDN prefill: prefetch two chunks ahead, 3 barriers per chunk
@@ -776,7 +730,7 @@ feature that removes masks.
 Each workgroup owns one slice of the GDN state for one sequence and head, and
 walks that sequence chunk by chunk, since each chunk's state update needs the
 previous one. It has 8
-waves in two groups of 4 (section 5). For every 64-token chunk it loads q, k,
+waves in two groups of 4. For every 64-token chunk it loads q, k,
 v and the gates from HBM, then does a lot of MFMA work in 4 phases. The two
 wave groups hand tiles to each other through LDS.
 
@@ -963,14 +917,14 @@ prefetch  tile 4              tile 8              tile 8 again (cache hit, disca
   again. It is already in cache, so it is cheap, and the loop body stays the
   same in every iteration.
 - **Q stays in LDS.** The prefetched K/V tile needs registers. Q is the same
-  for every tile, so it is kept in LDS and read from there (section 3.1), which
+  for every tile, so it is kept in LDS and read from there (section 2.1), which
   leaves the registers for the prefetch.
 
 #### Why the main loop needs no barrier
 
 A barrier is only needed when one wave reads LDS that **another** wave
 wrote. In QSA each wave stages its V tile in **its own** LDS region and is the
-only one that reads it back (for the transposed read of section 3.1). Inside
+only one that reads it back (for the transposed read of section 2.1). Inside
 one wave, LDS accesses complete in order, so no barrier is needed:
 
 ```
@@ -988,7 +942,7 @@ So QSA has barriers only in the prologue (slots and Q are written by all
 threads and read by all) and in the epilogue (the waves merge their results
 and reuse the V region).
 
-Compare with GDN in 4.1: there the waves *must* share tiles, because the two
+Compare with GDN in 3.1: there the waves *must* share tiles, because the two
 groups split the work of one chunk, so barriers are needed. In QSA the waves
 work on different tokens and share nothing until the end.
 
@@ -1041,7 +995,7 @@ o descriptor:  base = row bos of seq 0, num_records = T_local rows
 
 #### HC: pad the decode rows to the 16-row tile
 
-An MFMA always works on 16 rows (section 3), but at decode there may be only
+An MFMA always works on 16 rows (section 2), but at decode there may be only
 1–3 rows. The rows past `M` must read as zero. HC points them at the first
 address past the end of the activations, so the hardware returns 0:
 
@@ -1066,19 +1020,16 @@ row 15  [ 0 0 0 ... ]
 The padded rows give zero results, which are never stored. There is no
 branch, and every lane runs the same code.
 
-### 3.4 Summary of section 4
+### 3.4 Summary of section 3
 
 ```
-                    original design                  MI355X rewrite
-staging buffer      shared-memory stages (TMA)       registers, carried through the loop
-"data arrived"      mbarrier per stage               s_waitcnt, placed by the compiler
-"safe to read"      mbarrier phase                   workgroup barrier, placed by you
-GDN chunk loop      multi-stage TMA pipeline         2 chunks ahead, 3 barriers,
-                                                     k double-buffered
-QSA tile loop       multi-stage TMA pipeline         1 tile ahead, wave-private LDS,
-                                                     no barrier in the loop
-tails and padding   TMA OOB fill / masks             buffer descriptor: OOB load = 0,
-                                                     OOB store dropped
+                    previous kernel → why slow on MI355X     MI355X rewrite
+GDN chunk loop      8 kernels, state round trip via HBM      1 kernel, 2 chunks ahead,
+                    → every load cold, nothing to overlap    3 barriers, k double-buffered
+QSA tile loop       large accumulator in registers           1 tile ahead, wave-private LDS,
+                    → no registers left for a prefetch       no barrier in the loop
+tails and padding   per-lane masks / branches                buffer descriptor: OOB load = 0,
+                                                             OOB store dropped
 ```
 
 The rule: decide for every LDS tile who writes it and who reads it. Put a
