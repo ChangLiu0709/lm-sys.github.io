@@ -6,17 +6,17 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-Qwen3.8-Flash-Next is [TODO: one-line model positioning from the Qwen team, e.g. "the Qwen team's efficient flagship for coding and agent workloads"]. [One sentence for its community impact, and the reason binding to its model architecture, features, dataset(if involved), etc]. Thus, enablement and performance optimization of Qwen3.8-Flash-Next on MI355X is important. In our blog, we show how to optimize the inference of Qwen3.8-Flash-Next by ... We benchmark the inference performance on InferenceX AgentX, which [one sentence to introduce the dataset and benchmark metrics], outperforming our competitor NVIDIA B200 and B300 across all concurrency levels.
+Qwen3.8-Flash-Next is an efficient, open-weight MoE model, previewing the next-generation Qwen4 architecture. It has gained significant attention in the open-source community due to its strong coding and agentic capabilities, ultra-sparse architecture, and innovations such as Gated DeltaNet (GDN) and Qwen Sparse Attention (QSA) for efficient long-context inference. Given these strengths, enabling and optimizing Qwen3.8-Flash-Next inference on AMD Instinct MI355X GPUs is important. In this blog, we demonstrate how to improve its inference performance through a series of optimizations in SGLang on AMD GPUs. We benchmark inference performance using the InferenceX AgentX benchmark, which replays realistic multi-turn agentic coding workloads and measures throughput and interactivity across different concurrency levels. Our optimized MI355X implementation outperforms NVIDIA B200 and B300 GPUs across all tested concurrency levels.
 
-This post describes how we serve Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs with SGLang. We start with our latest performance result on InferenceX AgentX, then reveal the optimization behind the scene by briefly introducing the Qwen model architecure, the key optimizations, and the ideas of using AI agent to automate the process. All the results can be reproduced by referring to the command on SGLang cookbook [link].
+This post explores how we serve and optimize Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs using SGLang. We begin with our latest InferenceX AgentX benchmark results, followed by a introduction of the model architecture, key kernel optimizations for MI355X, including grid sizing for 256 CUs, kernel fusion, MFMA-native layouts, register prefetching, and wave64, and the monokernel for low concurrency. All results can be reproduced using the commands provided in the [SGLang cookbook](link).
 
 ## Performance
 
 We used InferenceX AgentX as our benchmark dataset and metrics, as [reasons]. As shown in Figure 1, [the overall configurations of the run, including concurrency list as ...] and [AgentX configurations, like including how many requests, benchmark time duration as 3600s]. [Analysis of the overall trend]. 
 
-// screenshot from InferenceX
+![InferenceX AgentX: token throughput per chip vs. P90 interactivity](/images/blog/qwen38-flash-next-mi355x/agentx_performance.jpg)
 
-*Figure 1 [TODO: chart]: throughput per GPU against interactivity across 1–16 agents.*
+*Figure 1 Total throughput per GPU against interactivity across concurrency 1–80.*
 
 [Analysis of the high concurrency scenario, with the optimizations, i.e., kernel fusion, xxx, (summary from our optimizations including the major software stacks)]. [Analysis of the low concurrency scenario: with monokernel, xxx]. We are going to give more details about the optimizations in the latter sections.
 
