@@ -82,22 +82,165 @@ These are the shapes the kernels see:
 
 The code below is taken from these PRs. Lines marked `...` are left out.
 
-## 1. Size the grid for 256 CUs, not for B300's SMs
+## 1. Size the grid to fill all 256 CUs (QSA sparse decode, GDN chunked prefill)
 
-**On NVIDIA** the launch shape of a kernel, meaning the split count, the tile
-sizes and the number of programs per row, is tuned for B300, which has up to
-160 SMs. Often these values are hard-coded in the launch heuristics.
+### 1.0 The basic idea
 
-**On MI355X** there are 256 CUs, at least 1.6× as many. A grid that fills a
-B300 fills only about 60% of an MI355X. At decode the grid is often even
-smaller. The old QSA decode ran one program per (row, KV head). Qwen3.8 has 2
-KV heads at TP1, so 8 decode rows gave 16 programs and left 240 CUs idle.
+A few terms first:
 
-**Rewrite:** split the long dimension until the grid fills the GPU, then add
-a small reduce step. Compute the split count from the CU count at run time.
-This is how the QSA kernel picks its KV split:
+- **CU** (compute unit) is the AMD version of an NVIDIA SM. MI355X has **256 CUs**.
+- **Workgroup (WG)** is the AMD name for a CUDA thread block (CTA). One WG
+  always runs on one CU.
+- **Grid** is the set of all WGs that one kernel launch creates. When you call
+  `launch(grid=(A, B, C))`, you get A × B × C workgroups.
+
+The kernels in this section use so much LDS or so many registers that only
+**one WG fits on a CU**. So the number of busy CUs is simply
+`min(grid size, 256)`:
+
+```
+grid = 16 WGs                          grid = 256 WGs
+┌────────────────────────────────┐     ┌────────────────────────────────┐
+│■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□│     │■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■│
+│□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□│     │■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■│
+│□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□│     │■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■│
+│   ...  (8 rows × 32 = 256 CUs)  │     │   ...                          │
+└────────────────────────────────┘     └────────────────────────────────┘
+ ■ busy CU   □ idle CU                  all 256 CUs pull data from HBM
+ 16 / 256 = 6% of the GPU works
+```
+
+Each kernel has two kinds of dimensions:
+
+| Kind | Where it lives | Example | Adds parallelism? |
+|---|---|---|---|
+| **Grid dimension** | one WG per index | rows, heads | **yes**, more WGs |
+| **Loop dimension** | a `for` loop *inside* one WG | KV positions, chunks, GEMM K | **no**, a longer loop in the same WG |
+
+The kernel finishes when its slowest WG finishes. If the grid dimensions are
+small (at decode they often are) and the loop dimension is long, a few WGs
+each run a long loop, and the rest of the GPU waits.
+
+The fix: **move part of the loop dimension into the grid**, until there are
+about 256 WGs. QSA decode (1.1) needed exactly this. GDN prefill (1.2) is the
+opposite case: there the long dimension *had to* stay inside the WG, so we
+size the other dimensions to fill the GPU and fall back to the old path when
+that is not possible.
+
+### 1.1 QSA sparse decode ([sglang#45196](https://github.com/sgl-project/sglang/pull/45196))
+
+#### What the kernel computes
+
+At decode, each **row** is one query token. In every decode step each request
+adds one row, and MTP verification adds one row per draft token. For one row
+the dimensions are:
+
+```
+one row (one query token), TP1
+
+  Q          24 query heads × 256 (head dim)
+             ├─ q heads  0..11 ──► KV head 0     GQA: 12 q heads share
+             └─ q heads 12..23 ──► KV head 1          one KV head
+
+  K, V       per KV head: 2,051 selected positions × 256
+             (indexer: 512 blocks × 4 tokens + up to 3 recent tokens)
+
+  output     24 × 256
+
+  loop work  2,051 positions × (Q·Kᵀ, softmax, P·V)   ◄── the long dimension
+```
+
+So there are three dimensions: **rows**, **KV heads** (only 2) and
+**KV positions** (2,051).
+
+#### Before: one WG per (row, KV head)
+
+The old ROCm path was Triton. The grid covered rows and KV heads, and each WG
+looped over all 2,051 positions by itself. Take the setup the 120 → 33 µs
+numbers were measured on: 8 requests at 32K context, which gives 8 rows.
+
+```
+grid = rows × KV heads = 8 × 2 = 16 WGs
+
+                 KV positions  0 ─────────────────────────────────► 2050
+row 0, kv 0    [ WG  ████████████████████████████████████████████████ ]
+row 0, kv 1    [ WG  ████████████████████████████████████████████████ ]
+row 1, kv 0    [ WG  ████████████████████████████████████████████████ ]
+   ...
+row 7, kv 1    [ WG  ████████████████████████████████████████████████ ]
+                     each WG reads 2,051 × 256 of K and V, serially
+
+CUs:  16 busy, 240 idle (6%)
+```
+
+#### Why that is slow
+
+Decode attention is memory bound: almost all the time goes into reading K and
+V from HBM. One CU can only have a limited number of loads in flight. With 16
+CUs working, the kernel uses a small part of the HBM bandwidth, and every WG
+runs the full 2,051-position loop. At 1 row it is even worse: 1 × 2 = 2 WGs
+on 256 CUs.
+
+Qwen3.8 makes this worse than most models because it has only **2 KV heads**.
+A model with 8 KV heads would get 4× more WGs from the same rows.
+
+#### Change: split the KV positions across WGs (split-KV)
+
+The new FlyDSL kernel cuts each row's 2,051 positions into `num_splits` pieces
+and gives each piece its own WG. The grid grows from (rows, KV heads) to
+**(rows, KV heads, `num_splits`)**:
+
+```
+grid = rows × KV heads × num_splits = 8 × 2 × 11 = 176 WGs
+
+                 KV positions  0 ─────────────────────────────────► 2050
+                 split 0   split 1   split 2         split 10
+                 0..191    192..383  384..575  ...   1920..2050
+row 0, kv 0    [  WG   ][  WG   ][  WG   ]  ...  [ WG  ]    ──► 11 partials
+row 0, kv 1    [  WG   ][  WG   ][  WG   ]  ...  [ WG  ]    ──► 11 partials
+   ...
+row 7, kv 1    [  WG   ][  WG   ][  WG   ]  ...  [ WG  ]    ──► 11 partials
+
+CUs:  176 busy, 80 idle (69%), and every WG's loop is 11× shorter
+```
+
+A WG now sees only part of the softmax, so it cannot write the final output.
+It writes a **partial** for each of its 12 query heads:
+
+- `O_i`: the not-yet-normalized output over its positions (256 values),
+- `m_i`: the max score in its piece,
+- `l_i`: the sum of `exp(score − m_i)` in its piece.
+
+A small **reduce kernel** then merges the partials of each (row, query head),
+the same way online softmax merges blocks:
+
+```
+m = max_i m_i
+O = Σ_i exp(m_i − m) · O_i   /   Σ_i exp(m_i − m) · l_i
+```
+
+Inside one WG the work is split once more. 4 waves each take a 16-token tile,
+so one *round* covers 64 positions. A split is always a whole number of
+rounds:
+
+```
+one split = 192 positions = 3 rounds
+
+            wave 0     wave 1     wave 2     wave 3
+round 0   [ 0..15  ] [ 16..31 ] [ 32..47 ] [ 48..63  ]
+round 1   [ 64..79 ] [ 80..95 ] [ 96..111] [112..127 ]
+round 2   [128..143] [144..159] [160..175] [176..191 ]
+```
+
+#### How `num_splits` is chosen
+
+It is computed from the CU count at run time, not hard-coded:
 
 ```python
+# aiter/ops/flydsl/kernels/qsa/sparse_decode_attn.py
+# A KV split always covers whole wave rounds of 16-token tiles.
+SPLIT_TOKEN_ALIGN = NUM_WAVES * TILE_TOKENS  # 4 waves x 16 tokens = 64
+
 # aiter/ops/flydsl/qsa_sparse_decode.py
 # Measured on MI355X (Hkv in {1, 2}, batch 1-128): one CTA per CU beats two, since
 # every extra split adds a prologue and a partial to merge; and below two 16-token
@@ -105,16 +248,25 @@ This is how the QSA kernel picks its KV split:
 _CTAS_PER_CU = 1
 _MIN_TOKENS_PER_SPLIT = 2 * SPLIT_TOKEN_ALIGN
 
+def _split_layout(topk: int, num_splits: int) -> tuple[int, int]:
+    """Tokens per split (whole wave rounds) and the split count that covers topk."""
+    per_split = -(-topk // max(1, num_splits))
+    per_split = -(-per_split // SPLIT_TOKEN_ALIGN) * SPLIT_TOKEN_ALIGN
+    return per_split, -(-topk // per_split)
+
 def recommended_num_splits(
     num_rows: int, num_kv_heads: int, topk: int, device: torch.device
 ) -> int:
     """KV splits that fill the GPU at this batch; fixed per CUDA-graph batch size."""
     _, num_cus = _device_info(torch.device(device).index or 0)
+    # (1) enough splits for one workgroup per CU
     wanted = -(-(_CTAS_PER_CU * num_cus) // max(1, num_rows * num_kv_heads))
+    # (2) but no split shorter than 128 tokens
     wanted = min(wanted, max(1, -(-topk // _MIN_TOKENS_PER_SPLIT)))
+    # (3) round each split up to whole 64-token rounds
     return _split_layout(topk, wanted)[1]
 
-# the kernel launch
+# the kernel launch: one workgroup per (row, KV head, split)
 sparse_decode_attn_kernel(...).launch(
     grid=(num_rows, num_kv_heads, num_splits),
     block=(BLOCK_THREADS, 1, 1),
@@ -122,14 +274,162 @@ sparse_decode_attn_kernel(...).launch(
 )
 ```
 
-For 8 rows and top-k 2051 this gives 11 splits, which is 176 CTAs instead of
-16. A small reduce kernel merges the partial results. It is skipped when there
-is only one split, which happens at 128 rows.
+(`-(-a // b)` is ceiling division.) Each of the three steps has a reason:
 
-GDN prefill has the opposite problem. Each workgroup walks its sequence's
-chunks serially, so a long sequence with few heads makes a small grid. The
-wrapper picks the V slice width from the CU count. A gate sends grids that are
-still too small to the multi-kernel path:
+| Step | Rule | Why |
+|---|---|---|
+| (1) | aim for 1 WG per CU | More WGs than CUs does not help. Each extra split adds its own prologue and one more partial to merge. |
+| (2) | at least 128 positions per split | That is 2 tiles per wave. With less, the fixed cost of starting a WG is larger than the gain. |
+| (3) | round up to 64 positions | One round is 4 waves × 16 tokens. A partial round would leave waves idle. |
+
+Worked example, 8 rows, top-k 2051:
+
+1. 256 CUs / (8 rows × 2 KV heads) = 16 splits would give one WG per CU.
+2. The 128-position minimum allows up to ⌈2051 / 128⌉ = 17 splits, so 16 stays.
+3. 2051 / 16 = 129 positions per split, rounded up to 192 (3 × 64). Covering
+   2,051 positions with 192-position splits takes ⌈2051 / 192⌉ = 11 splits.
+
+The same rule at other batch sizes (TP1, 2 KV heads):
+
+| Rows | Old grid (rows × 2) | `num_splits` | Positions per split | New grid | CUs busy |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 17 | 128 | 34 | 13% (limited by step 2) |
+| 8 | 16 | 11 | 192 | 176 | 69% |
+| 16 | 32 | 7 | 320 | 224 | 88% |
+| 32 | 64 | 4 | 576 | 256 | 100% |
+| 128 | 256 | 1 | 2,051 | 256 | 100%, no split, no reduce |
+
+At 128 rows the old grid already fills the GPU, so nothing is split and the
+reduce kernel is skipped. The split count depends only on the batch size, so
+it is fixed for each captured CUDA-graph batch (see section 7).
+
+#### Result
+
+Time per call, 8 rows at 32K context:
+
+```
+before (Triton)                                              120 µs
+├─ attention  (_sparse_gqa_chunk_prefill, 16 WGs)  ███████████████████  71.8
+├─ KV gather  (_compact_kv)                         ██████████          39.4
+└─ helpers    (_fa2_valid_counts, _fa2_prefix_sum)  ██                   8.8
+
+after (FlyDSL)                                                33 µs
+├─ attention  (sparse_decode_attn_kernel, 176 WGs)  ███████             28.9
+└─ reduce     (sparse_decode_reduce_kernel)         █                    4.4
+```
+
+Split-KV is the reason the attention part dropped from 71.8 to 28.9 µs. The
+gather and helper kernels went away for a different reason (fusion, see
+section 2).
+
+The speedup is largest where the old grid was emptiest:
+
+| Batch (TP1) | Old grid | FlyDSL | Triton | Speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 2 WGs | 16.6 µs | 89.6 µs | 5.4× |
+| 16 | 32 WGs | 25.3 µs | 112.4 µs | 4.4× |
+| 128 | 256 WGs | 100.9 µs | 344.4 µs | 3.4× |
+
+At batch 128 the grid was already full. The 3.4× there comes from the fusion
+and the MFMA rewrite (sections 2 and 3), not from the split.
+
+### 1.2 GDN chunked prefill ([sglang#44103](https://github.com/sgl-project/sglang/pull/44103))
+
+#### What the kernel computes
+
+GDN is linear attention. Instead of a KV cache, each value head keeps a
+fixed-size **state** matrix `S` of K × V = 128 × 128. Prefill reads the
+sequence in 64-token chunks. For each chunk it computes the output from the
+state and then updates the state:
+
+```
+one value head h of one sequence (L tokens), TP1 has 48 such heads
+
+  tokens  [chunk 0][chunk 1][chunk 2] ... [chunk L/64 − 1]      64 tokens each
+              │        │        │                  │
+              ▼        ▼        ▼                  ▼
+  S_h:   S₀ ──────► S₁ ──────► S₂ ──── ... ────► S_last           128 × 128
+          per chunk:
+            (a) l2norm(q, k), k·kᵀ, (I + A)⁻¹     ◄── does not depend on V
+            (b) output of the chunk from q and S
+            (c) S ← decay · S + kᵀ · v_new         ◄── needs the previous S
+```
+
+Step (c) is a **recurrence**: chunk `c + 1` needs the state that chunk `c`
+produced. So the chunk dimension is serial by nature.
+
+But the **V columns of `S` are independent**. Column `j` of the state only
+needs column `j` of `v`, so the state can be cut into V slices of width `BV`
+and every slice can be updated by a different WG:
+
+```
+state S_h: 128 (K) × 128 (V)
+
+BV = 32:   ┌────┬────┬────┬────┐        BV = 16:  ┌─┬─┬─┬─┬─┬─┬─┬─┐
+        K  │WG 0│WG 1│WG 2│WG 3│                  │0│1│2│3│4│5│6│7│
+       128 │    │    │    │    │                  │ │ │ │ │ │ │ │ │
+           └────┴────┴────┴────┘                  └─┴─┴─┴─┴─┴─┴─┴─┘
+            4 slices of 128 × 32                   8 slices of 128 × 16
+```
+
+The cost: step (a) does not depend on V, so every V slice computes it again.
+More slices means more WGs, but also more duplicated work.
+
+#### Before: the multi-kernel (staged) path, 8 launches per layer
+
+The staged path split the work into separate kernels. The parallel stages
+used one WG per (chunk, head), so all chunks of all sequences were spread over
+the GPU at once. Only the state scan was serial over chunks. Between the
+kernels, the state after **every** chunk was written to HBM and read back:
+
+```
+K1..  prepare    grid ~ chunks × heads   all chunks in parallel ─┐
+      state scan grid ~ heads × V tiles  serial over chunks      │ per-chunk
+                                         writes S₀, S₁, … to HBM ├ states go
+..K8  output     grid ~ chunks × heads   reads the states back   │ through HBM
+                                                                 ┘
+```
+
+The grid was large, but a 16K-token layer took 8 launches and 1,227 µs. Most
+of that went to the HBM round trips and launches (see section 2).
+
+#### Change: one fused kernel, chunks stay inside the WG
+
+The fused kernel keeps the state slice in MFMA accumulators (registers) for
+the whole sequence. To do that, one WG has to own the slice from the first
+chunk to the last, so the **chunk dimension leaves the grid** and becomes the
+WG's loop:
+
+```
+grid = (128 / BV) V slices × N sequences × H value heads
+
+WG (sequence n, head h, V slice j):
+   chunk 0 ─► chunk 1 ─► chunk 2 ─► ... ─► chunk L/64 − 1
+   └──────── state slice 128 × BV stays in registers ────────┘
+             about 2.5 µs per chunk, whatever H is
+```
+
+This is the opposite of QSA. QSA moved its long dimension *into* the grid.
+GDN had to move it *out*, because a recurrence cannot be split across WGs
+without a round trip through HBM. Now the grid size does not depend on
+sequence length at all, only on V slices × sequences × heads. So the
+question is: is that enough to fill 256 CUs?
+
+#### Sizing the grid: pick `BV`, and know when to give up
+
+`H` is the number of value heads on **this** GPU. Tensor parallelism (TP)
+splits the heads evenly across GPUs, so `H` = 48 / TP, and the grid shrinks
+as TP grows.
+
+The fused kernel uses so much LDS that only one WG fits on a CU. With more
+than 256 WGs, the extra WGs wait for a second pass over the CUs, and the
+whole serial chunk walk runs twice. So:
+
+```
+kernel time ≈ ⌈grid / 256⌉ passes × (number of chunks) × 2.5 µs
+```
+
+The wrapper picks `BV` from that:
 
 ```python
 # aiter/ops/flydsl/gdn_fused_prefill.py
@@ -142,7 +442,19 @@ def _pick_bv(N: int, H: int, device: torch.device) -> int:
     V-independent work half as often.
     """
     return 16 if (_VD // 16) * N * H <= _num_cus(device) else 32
+```
 
+- **BV = 16** (8 slices) if 8 × N × H ≤ 256: everything fits in one pass, and
+  narrower slices make each chunk step faster.
+- **BV = 32** (4 slices) otherwise: half the WGs, so step (a) is repeated half
+  as often, and it is more likely to fit in one pass.
+
+When the grid is still too small, the fused kernel loses. A few WGs walk a
+long sequence serially while most CUs are idle, and the staged path, which
+spreads all chunks over the GPU, is faster. A gate sends those batches to the
+staged path:
+
+```python
 # in gdn_fused_prefill_supported(...):
     # The fused kernel walks each sequence's chunks serially at ~2.5 us per
     # chunk whatever H is; the multi-kernel path spreads all chunks over the
@@ -151,114 +463,203 @@ def _pick_bv(N: int, H: int, device: torch.device) -> int:
         return False
 ```
 
-For Qwen3.8 at TP1 (48 value heads) the gate never declines a batch. At TP8
-there are only 6 value heads, and one 16K sequence is 48 workgroups on 256 CUs.
-There the fused kernel is 0.63× and the gate sends the batch to the
-multi-kernel path.
+How to read the condition (`T` = total tokens in the batch):
 
-## 2. Remove the extra passes around the main kernel
+- `max_seqlen ≤ 1024`: at most 16 chunks, so the serial walk is short. Always
+  use the fused kernel.
+- `H · T ≥ 24 · max_seqlen`: `T / max_seqlen` is roughly "how many sequences
+  of full length" are in the batch. So `H · T / max_seqlen` is about the number
+  of (sequence, head) pairs. With 8 V slices, 24 pairs are 192 WGs, about
+  75% of the CUs. Fewer than that, and the fused kernel is not worth it.
 
-**Typical structure:** the main kernel is surrounded by helper passes. In
-QSA, a Triton kernel gathered each row's 2,051 selected KV positions into a
-packed buffer so that a standard dense decode kernel could run on it. In GDN,
-the staged path wrote every per-chunk state to HBM and read it back in a
-separate output kernel. Each pass adds a round trip through HBM and a launch.
+For one 16K sequence (N = 1, 256 chunks):
 
-**On MI355X**, at decode sizes, these passes became the main cost. QSA spent
-39 µs of its 120 µs on the gather alone. Staged GDN took 8 launches per layer.
+| TP | `H` per GPU | BV | Grid | CUs busy | Gate (H ≥ 24?) | Path used |
+|---:|---:|---:|---:|---:|---|---|
+| 1 | 48 | 32 | 4 × 48 = 192 | 75% | yes | fused |
+| 2 | 24 | 16 | 8 × 24 = 192 | 75% | yes | fused |
+| 4 | 12 | 16 | 8 × 12 = 96 | 38% | no | staged |
+| 8 | 6 | 16 | 8 × 6 = 48 | 19% | no | staged (fused would be 0.63×) |
 
-**Rewrite:** fuse into one kernel and keep the intermediates on chip. The QSA
-kernel does the lookup from index to pool slot itself. Each CTA resolves its
-share of the 2,051 positions once and keeps the slots in LDS, so the gather
-pass and its scratch buffer go away:
+At TP1 (our setup) `H · T ≥ 48 · max_seqlen` always holds, so the gate never
+declines a batch. At TP1 with one sequence, BV = 16 would give 384 WGs and two
+passes, so `_pick_bv` takes BV = 32 and one pass of 192 WGs.
+
+#### Result
+
+At 16K tokens one layer takes 1 launch and 767 µs instead of 8 launches and
+1,227 µs (1.6×). At 32K it is 1.54 ms, compared with 2.52 ms for the staged
+path and 3.37 ms for Triton (2.2×).
+
+### 1.3 Summary of section 1
+
+```
+                 QSA sparse decode                 GDN chunked prefill
+long dimension   2,051 KV positions                L / 64 chunks
+can it be split? yes: softmax partials merge       no: the state recurrence
+                 in a small reduce                 is serial
+before           grid = rows × KV heads (16)       staged, chunks in the grid
+                 long loop per WG                  but state through HBM
+change           move positions INTO the grid      move chunks OUT of the grid,
+                 (rows × KV heads × splits)        fill it with V slices × heads
+knob             num_splits from the CU count      BV from the CU count,
+                                                   plus a gate to fall back
+```
+
+In both cases, compute the grid from the CU count at run time. Do not copy
+the grid from the NVIDIA kernel, and do not hard-code it.
+
+## 2. Rewrite the MMA part for MFMA, don't translate it
+
+### 2.0 The basic idea: two different matrix engines
+
+Both GPUs have matrix units, but they are used in very different ways.
+
+```
+B300 (SM100), tcgen05                       MI355X (gfx950), MFMA
+
+  one thread issues one MMA                   every wave (64 lanes) issues
+  for the whole CTA                           its own MFMA
+
+  tile: 128 × N per CTA                       tile: 16 × 16 (or 32 × 32) per wave
+        (256 × N with a CTA pair)
+
+  operands:  shared memory (TMA puts          operands:  registers, every lane
+             them there)                                 holds a small piece
+
+  accumulator: Tensor Memory (TMEM),          accumulator: registers, every lane
+             256 KB per SM, NOT registers                holds a small piece
+```
+
+What this means for a kernel:
+
+| | B300 | MI355X | Consequence |
+|---|---|---|---|
+| Who holds the data | the hardware (SMEM, TMEM) | each of the 64 lanes | You must know which lane holds which element |
+| Tile size | large (128 × N) | small (16 × 16) | A big tile is many MFMAs, and you choose how to place them |
+| Accumulator | TMEM, outside the register file | registers | A big accumulator takes registers away from everything else |
+
+The register cost is real. Take a 128 × 256 fp32 accumulator, a normal size on
+B300. On MI355X, spread over a workgroup of 4 waves (256 lanes), it takes
+128 × 256 / 256 = **128 registers per lane**, before any operands, addresses
+or prefetch buffers. On B300 the same accumulator sits in TMEM and costs no
+registers.
+
+So a tile layout or fragment mapping copied from a CUDA kernel is wrong (the
+lanes hold other elements) or slow (it does not fit in registers, or it needs
+extra copies through LDS). You have to design the MMA part again. The rest of
+this section shows how we did it for three cases:
+
+| | Kernel | Problem | Rewrite |
+|---|---|---|---|
+| 3.1 | QSA sparse decode | chain QKᵀ → softmax → PV without going through LDS | transpose the problem so the accumulator is the next operand |
+| 3.2 | GDN chunked prefill | triangular inverse is a serial loop | compute it with matrix products only |
+| 3.3 | HC GEMV | each lane loads its own fragment from HBM | store the weights in fragment order |
+
+#### How one MFMA spreads over 64 lanes
+
+You need this picture to follow the rest. For
+`mfma_f32_16x16x16bf16_1k`, `D[16×16] = A[16×16] · B[16×16] + C`, every lane
+`l` has a column `n = l % 16` and a group `g = l // 16` (0..3):
+
+```
+B operand (K × N), 4 bf16 per lane       C / D accumulator (M × N), 4 fp32 per lane
+
+           n = 0    1    2  ...  15                 n = 0    1    2  ...  15
+ k  0.. 3:   L0   L1   L2  ...  L15       rows  0.. 3:   L0   L1   L2  ...  L15
+ k  4.. 7:  L16  L17  L18  ...  L31       rows  4.. 7:  L16  L17  L18  ...  L31
+ k  8..11:  L32  L33  L34  ...  L47       rows  8..11:  L32  L33  L34  ...  L47
+ k 12..15:  L48  L49  L50  ...  L63       rows 12..15:  L48  L49  L50  ...  L63
+
+ lane l holds column l % 16,               lane l holds column l % 16,
+ 4 values starting at k = 4·(l // 16)      4 values starting at row 4·(l // 16)
+```
+
+**The two pictures are the same.** The accumulator of one MFMA has exactly
+the layout of the **B** operand of the next one, so it can be passed on
+without moving any data. (The A operand has rows per lane instead of columns,
+so the accumulator does *not* match A.)
+
+The `16x16x32` variant used for QKᵀ looks the same but holds 8 values per
+lane, starting at `k = 8·(l // 16)`.
+
+On NVIDIA it is the other way round. In FlashAttention-2 the accumulator of
+`mma.m16n8k16` has the layout of the **A** operand, so FA2 computes
+`S = Q·Kᵀ` with Q on M and passes P as A to `P·V`. If you copy that on
+MI355X, P lands in the wrong lanes, and you need an extra trip through LDS for
+every tile.
+
+### 2.1 QSA sparse decode: keep the softmax in registers
+
+#### What the kernel computes
+
+For one row, one KV head and one 16-token tile (dims from section 1.1):
+
+```
+S = Q · Kᵀ        Q: 12 heads × 256        K: 16 tokens × 256    S: 12 × 16
+P = softmax(S)    (online: running max and sum per head)
+O += P · V        V: 16 tokens × 256                             O: 12 × 256
+```
+
+Decode has only 1 query token, so the "query" side of the MMA is the 12 heads
+of the GQA group. That fits the 16-wide MFMA with 4 padding columns.
+
+#### Before: the NVIDIA layout
+
+On NVIDIA the PR replaces a Triton KV gather plus the FlashInfer TRT-LLM decode
+kernel, built around large tcgen05 tiles with the accumulator in TMEM. Moved
+to MFMA with FA2's layout (heads on M, P as the A operand), the P tile would
+have to be written to LDS and read back in another layout after every
+16-token tile.
+
+#### Change: put tokens on M and heads on N, so P is already a B operand
+
+The FlyDSL kernel computes everything transposed: `Sᵀ = K · Qᵀ` and
+`Oᵀ += Vᵀ · Pᵀ`.
+
+```
+STEP 1   Sᵀ = K · Qᵀ        mfma_f32_16x16x32_bf16, 8 steps over head dim 256
+
+         A = K tile         16 tokens × 32 dims    straight from the KV pool;
+                                                   lane: 1 token, 8 contiguous bf16
+         B = Qᵀ             32 dims × 16 heads     from LDS (12 heads + 4 padding)
+         C = Sᵀ             16 tokens × 16 heads   lane: 1 head, 4 tokens
+                                    │
+STEP 2   online softmax on C, in registers ──► Pᵀ (convert to bf16)
+                                    │
+                                    │  same lanes, same layout, no data movement
+                                    ▼
+STEP 3   Oᵀ += Vᵀ · Pᵀ      mfma_f32_16x16x16bf16_1k, 16 times (16 dims each)
+
+         A = Vᵀ             16 dims × 16 tokens    from LDS, transposed read
+                                                   (ds_read_b64_tr_b16)
+         B = Pᵀ             16 tokens × 16 heads   ◄── = C of step 1
+         C = Oᵀ             16 dims × 16 heads     × 16 tiles = 256 dims
+```
+
+Why each choice was made:
+
+- **Tokens on M, heads on N.** One K tile (16 tokens) is used by all 12 heads
+  of the group in a single MFMA. Each lane reads one token's 8 contiguous
+  bf16 values straight from the pool.
+- **Step 1 accumulator = step 3 B operand.** In step 1 each lane ends up with
+  1 head × 4 tokens. Step 3 needs B = Pᵀ (tokens × heads), and the B layout
+  puts 1 head (column) × 4 tokens (k) in each lane. It is the same data in the
+  same lane.
+- **`16x16x16` for PV, not `16x16x32`.** The PV MFMA has the tokens on k. The
+  `16x16x16` variant takes 4 values of k per lane, which matches the 4 tokens
+  in each lane of the step 1 accumulator. The `x32` variant takes 8 per lane
+  and would not match.
+- **V read transposed.** Step 3 needs Vᵀ as the A operand: each lane needs 4
+  tokens of *one* dim, but V is stored by token. `ds_read_b64_tr_b16` reads a
+  64-bit piece from LDS and transposes it on the way. It is the gfx950
+  counterpart of `ldmatrix.trans`.
+
+The code, with the three steps marked:
 
 ```python
 # aiter/ops/flydsl/kernels/qsa/sparse_decode_attn.py
-# ---- Prologue: logical positions -> pool slots, staged in LDS ----
-for j in range_constexpr(prologue_iters):
-    local = tid + j * BLOCK_THREADS
-    tok = split_start + local
-    in_range = (local < tokens_per_split) & (tok < topk)
-    safe_tok = fx.Int64(in_range.select(tok, zero_i32))
-    pos = fx.ptr_load(fx.add_offset(indices, idx_row + safe_tok))
-    valid = in_range & (pos >= 0) & (pos < seq_len)
-    safe_pos = fx.Int64(valid.select(pos, zero_i32))
-    slot = fx.ptr_load(fx.add_offset(req_to_token, r2t_row + safe_pos))
-    slot = valid.select(slot, fx.Int32(-1))
-    ...
-    _lds_store(slot_off + local * 4, fx.Int32, slot)
-```
-
-In GDN the state slice stays in MFMA accumulators across all chunks. The work
-that doesn't depend on V (l2norm, `k·kᵀ`, the triangular inverse) is
-recomputed by every V slice, which is cheaper than a round trip through HBM.
-At 16K tokens one layer becomes 1 launch and 767 µs instead of 8 launches and
-1,227 µs.
-
-At the HC site the fusion is pure algebra, and it would work on any vendor.
-The RMSNorm weight and the inject projection are folded into the packed down
-weights once, at load time:
-
-```python
-# python/sglang/kernels/ops/gemm/hc_fused_flydsl.py
-class HcFusedWeights:
-    def __init__(self, down, up, inject, norm_weight, eps):
-        ...
-        self.w1 = (1.0 + norm_weight.float()).contiguous()
-        rows = [down.float() * self.w1]
-        if inject is not None:
-            self.ni = inject.shape[0]
-            rows.append(inject.float() * self.w1)
-        d = torch.cat(rows)
-```
-
-The per-branch `rsqrt` is applied to each split-K partial in the reduce
-kernel. A split never covers two branches, so this works:
-
-```python
-# _hc_reduce_fused
-per = SPLIT // _HC
-acc = fx.Float32(0.0)
-for b in range_constexpr(_HC):
-    total = fx.Float32(0.0)
-    for j in range_constexpr(NP):
-        total = total + _load(ss, row * (_HC * NP) + (b * NP + j), 1, fx.Float32)[0]
-    scale = fx.Float32(1.0) / math.sqrt(total * fx.Float32(_HC / K) + fx.Float32(EPS))
-    part = fx.Float32(0.0)
-    for s in range_constexpr(b * per, (b + 1) * per):
-        part = part + _load(p, fx.Int32(s * M * R) + i, 1, fx.Float32)[0]
-    acc = acc + part * scale
-```
-
-The sums of squares `ss` come from the previous site's combine
-(`hc_apply_inject`). It computes them while it writes the residual, so the
-next norm needs no extra pass over the data. The same idea was proposed for
-SM100 in [sglang#40552](https://github.com/sgl-project/sglang/pull/40552).
-
-## 3. Rewrite the MMA part for MFMA, don't translate it
-
-**On NVIDIA** B300 kernels are built around tcgen05 MMAs. A single thread
-issues one MMA for the whole CTA on large tiles (128×N, or up to 256×N across
-a CTA pair). TMA brings the operands into shared memory, and the accumulator
-sits in Tensor Memory (TMEM, 256 KB per SM), outside the register file.
-
-**On MI355X** each wave of 64 lanes issues its own MFMA on 16×16 tiles. Both
-the operands and the accumulators are in registers, so a large accumulator
-tile uses up the register budget that TMEM keeps free on B300. The lane layout
-(`lane % 16`, `lane // 16`) is also different. A tile layout or fragment
-mapping copied from a CUDA kernel will be wrong or slow.
-
-**Rewrite:** choose the operand placement so the data flows from one MFMA to
-the next without going through LDS. In QSA, the 16 tokens of a tile go on M
-and the 12 query heads of a KV group go on N, so one K tile serves the whole
-group. The QK accumulator then has exactly the B-operand layout of the PV
-MFMA, so the softmax probabilities never leave registers. V is read back
-transposed with `ds_read_b64_tr_b16`, the gfx950 counterpart of
-`ldmatrix.trans`.
-
-```python
-# aiter/ops/flydsl/kernels/qsa/sparse_decode_attn.py
-# QK^T: A = K row s straight from the pool, B = Q from LDS
+# STEP 1  QK^T: A = K row s straight from the pool, B = Q from LDS
 acc = fx.Vector.filled(4, 0.0, fx.Float32)
 for step in range_constexpr(HEAD_DIM // 32):
     q_op = _lds_load_vec(
@@ -269,13 +670,14 @@ for step in range_constexpr(HEAD_DIM // 32):
             T.f32x4, [_kv_to_bf16(k_cur[step]), q_op, acc, 0, 0, 0]
         )
     )
-...  # online softmax on acc, in registers
+# STEP 2  online softmax on acc, in registers
+...
 p_op = (
     fx.Vector.from_elements(probs, dtype=fx.Float32)
     .to(fx.BFloat16)
     .bitcast(fx.Int16)
 )
-# PV: the QK accumulator is already the B operand
+# STEP 3  PV: the QK accumulator is already the B operand
 for m in range_constexpr(16):
     v_op = rocdl.ds_read_tr16_b64(
         fx.Vector.make_type(4, fx.BFloat16),
@@ -291,52 +693,276 @@ for m in range_constexpr(16):
     )
 ```
 
-FlashAttention does the same on NVIDIA, but you have to find the matching
-layout again for MFMA.
+(`s` = `lane % 16`, `g` = `lane // 16`; `alpha` is the online-softmax rescale
+factor; `m * 512` steps over 16 × 16 bf16 V sub-tiles.)
 
-Two more patterns from our kernels:
+#### How it helps
 
-- **Avoid serial steps.** GDN needs `(I + A)⁻¹` of a strictly lower 64×64
-  block for every chunk. Instead of a serial forward substitution, each 16×16
-  diagonal block is inverted with matrix products only:
+- P never leaves the registers. There is no LDS write, barrier or read
+  between the softmax and PV.
+- The output accumulator is 16 tiles × 4 fp32 = **64 registers per lane**.
+  That is small enough to leave room for the K/V prefetch buffers of
+  section 4. Q is kept in LDS (not registers) for the same reason.
+- The cost: 4 of the 16 columns are padding (12 heads), so 25% of each MFMA
+  is wasted. That is cheap, because decode is limited by memory, not by
+  matrix throughput.
 
-  ```python
-  # aiter/ops/flydsl/kernels/gdr_prefill/gdn_fused_prefill.py
-  def _diag_inverse(aa, ab, ident):
-      """(I + A)^-1 of a strictly lower 16x16 block via (I-A)(I+A^2)(I+A^4)(I+A^8).
-      ...
-      Products are split-bf16, close to fp32.
-      """
-  ```
+FlashAttention does the same thing on NVIDIA. The idea carries over, but the
+layout that makes it work is different, and you have to work it out again
+for MFMA.
 
-  Each product runs as 3 bf16 MFMAs on hi/lo halves (`_mm16_x3`). This gives
-  close to fp32 accuracy at bf16 MFMA speed.
-- **Pack weights in fragment order.** The HC weights are packed once so that
-  one 16×32 B fragment is 64 lanes × 8 bf16. Each lane then gets its part
-  with one 128-bit buffer load:
+### 2.2 GDN prefill: replace a serial loop with matrix products
 
-  ```python
-  # python/sglang/kernels/ops/gemm/hc_fused_flydsl.py
-  def _pack(w):
-      n, k = w.shape
-      return w.reshape(n // 16, 16, k // 32, 4, 8).permute(0, 2, 3, 1, 4).contiguous()
-  ```
+#### What the kernel computes
 
-## 4. Replace TMA and `cp.async` pipelines with register prefetch
+For every 64-token chunk, GDN needs `(I + A)⁻¹`, where `A` (64 × 64) is
+strictly lower triangular (zeros on and above the diagonal). It is split into
+4 × 4 blocks of 16 × 16:
 
-**On NVIDIA** latency is hidden by multi-stage pipelines. TMA or `cp.async`
-copies tiles from global memory straight into shared memory, and an mbarrier
-per stage says when a stage is full or free.
+```
+            64 × 64 matrix (I + A), 16 × 16 blocks
 
-**On MI355X** our kernels use the register file as the staging buffer. Every
-thread issues buffer loads for a tile that will be used *later*. The loaded
-values are carried through the loop in registers. When their turn comes they
-are written to LDS, the workgroup synchronizes, and the MFMAs read the tile.
-The synchronization is now an ordinary workgroup barrier, so you have to place
-the barriers yourself.
+          col 0    col 1    col 2    col 3
+row 0   [ D0     |  0     |  0     |  0     ]     D = diagonal block:
+row 1   [ L10    | D1     |  0     |  0     ]         I + (strictly lower)
+row 2   [ L20    | L21    | D2     |  0     ]     L = full block below
+row 3   [ L30    | L31    | L32    | D3     ]
 
-This is the chunk loop of the fused GDN kernel. Inputs are prefetched two
-chunks ahead:
+  step 1: invert the 4 diagonal blocks D0..D3   ◄── this part is serial
+  step 2: fill the blocks below from them with matrix products
+```
+
+#### Before: forward substitution
+
+The usual way to invert a triangular block (e.g. `solve_tril` in the FLA
+Triton kernels) is forward substitution: row `i` of the inverse needs all rows
+before it. For a 16 × 16 block that is **16 dependent steps** of small vector
+work. On MI355X this is bad: the matrix cores do nothing during the loop,
+and every step waits for the previous one.
+
+#### Change: invert each diagonal block with 6 matrix products
+
+Because `A` is strictly lower 16 × 16, `A¹⁶ = 0`. So the series
+`(I + A)⁻¹ = I − A + A² − A³ + … − A¹⁵` ends, and it factors as
+
+```
+(I + A)⁻¹ = (I − A) · (I + A²) · (I + A⁴) · (I + A⁸)
+
+  A² = A·A,   A⁴ = A²·A²,   A⁸ = A⁴·A⁴        3 squarings
+  then 3 products to multiply the 4 factors    3 products
+                                               ─────────────
+                                               6 matrix products, all MFMA
+```
+
+Multiplying out gives every power of `A` from 0 to 15 exactly once, with the
+right sign. That is 16 serial steps replaced by 6 matrix products, and only
+the squarings depend on each other (`log₂ 16 = 4` levels).
+
+```python
+# aiter/ops/flydsl/kernels/gdr_prefill/gdn_fused_prefill.py
+def _diag_inverse(aa, ab, ident):
+    """(I + A)^-1 of a strictly lower 16x16 block via (I-A)(I+A^2)(I+A^4)(I+A^8).
+    ...
+    Products are split-bf16, close to fp32.
+    """
+```
+
+**Accuracy: split-bf16.** The MFMAs take bf16 (8-bit mantissa), but an
+inverse needs about fp32 accuracy. Each fp32 value `x` is split into
+`hi = bf16(x)` and `lo = bf16(x − hi)`, and each product becomes 3 bf16
+MFMAs:
+
+```
+x · y ≈ hi_x·hi_y + hi_x·lo_y + lo_x·hi_y        (lo_x·lo_y is too small to matter)
+        └───────── 3 MFMAs (_mm16_x3) ─────────┘
+```
+
+This gives close to fp32 accuracy at bf16 MFMA speed.
+
+#### How it helps
+
+The inverse runs on the matrix cores, with no long chain of dependent steps.
+This matters because the chunk step is on the critical path: the fused kernel
+walks the chunks one after another (section 1.2), so any time saved per chunk
+is saved 256 times at 16K tokens.
+
+### 2.3 HC GEMV: store the weights the way the lanes read them
+
+#### What the kernel computes
+
+At decode, the HC site multiplies a few rows of activations (M ≤ 128,
+K = 10,240) by a fixed weight matrix. The time goes into reading the weights,
+so how each lane reads them decides the speed.
+
+For `mfma_f32_16x16x32_bf16`, one B fragment is a 16 (n) × 32 (k) piece of the
+weights. Lane `l` needs column `n = l % 16` and 8 values starting at
+`k = 8·(l // 16)`.
+
+#### Before: weights row-major (one row per output)
+
+On B300 TMA copies a whole tile into shared memory and handles the layout, so
+the layout in HBM hardly matters. On MI355X there is no TMA here. Each lane
+loads its own piece straight into registers, so the HBM layout decides the
+access pattern:
+
+```
+row-major w[n][k] (k = 10,240 → row stride 20 KB)
+
+  lanes 0,16,32,48  ──► row n0      bytes 0..63
+  lanes 1,17,33,49  ──► row n0+1    bytes 0..63    (20 KB further)
+  ...
+  lanes 15,31,47,63 ──► row n0+15                 (300 KB further)
+
+  one wave load = 16 pieces of 64 bytes, scattered over 300 KB
+```
+
+#### Change: pack each fragment into 1 KB, in lane order
+
+At load time the weights are rearranged once, so each 16 × 32 fragment is one
+contiguous 1 KB block, in the order the lanes need it:
+
+```python
+# python/sglang/kernels/ops/gemm/hc_fused_flydsl.py
+def _pack(w):
+    n, k = w.shape
+    return w.reshape(n // 16, 16, k // 32, 4, 8).permute(0, 2, 3, 1, 4).contiguous()
+```
+
+How to read the reshape and permute:
+
+```
+w[n, k]  ──reshape──►  [n_tile, n_in(16), k_tile, g(4), e(8)]    k = 32·k_tile + 8·g + e
+         ──permute──►  [n_tile, k_tile, g(4), n_in(16), e(8)]
+                                       └──── 1 KB fragment ────┘
+                                        lane = 16·g + n_in, 8 bf16 each
+
+one fragment in memory:
+  [ lane 0: 8 bf16 | lane 1: 8 bf16 | ... | lane 63: 8 bf16 ]   = 64 × 16 B = 1 KB
+```
+
+Now lane `l` reads 16 bytes at `fragment_base + 16·l`: one 128-bit buffer
+load per lane, and the whole wave reads one contiguous 1 KB block. The next
+fragment (next `k_tile`) is the next 1 KB.
+
+#### How it helps
+
+- Every wave load is one contiguous block with full cache lines, not 16
+  scattered pieces.
+- The address is just `base + 16·lane + 1024·tile`, with no per-lane index
+  math in the loop.
+- It costs nothing at run time: the packing is done once when the weights are
+  loaded, together with the RMSNorm folding from section 2.
+
+### 2.4 Summary of section 3
+
+```
+                  NVIDIA habit                       MI355X rewrite
+QSA  QK → PV      S = Q·Kᵀ, P passed as A            Sᵀ = K·Qᵀ, Pᵀ passed as B
+                  (C layout = A layout on mma)       (C layout = B layout on MFMA)
+GDN  (I + A)⁻¹    forward substitution, serial       (I−A)(I+A²)(I+A⁴)(I+A⁸),
+                                                     6 split-bf16 matrix products
+HC   weights      row-major, TMA handles layout      packed in lane order,
+                                                     1 KB per fragment
+```
+
+The rule in all three: start from the MFMA lane layout and choose the data
+placement to fit it. Do not start from the CUDA kernel's tiles.
+
+## 3. Replace TMA and `cp.async` pipelines with register prefetch
+
+### 3.0 The basic idea: start the load early
+
+A load from HBM takes a long time: many hundreds of cycles before the data
+arrives. If a kernel loads a tile and then waits for it, the matrix cores do
+nothing during that time:
+
+```
+no prefetch      [load 0 ·····wait·····][compute 0][load 1 ·····wait·····][compute 1]
+                                         ▲ busy                            ▲ busy
+
+prefetch         [load 0 ·····][load 1 ·····][load 2 ·····][load 3 ·····]
+(loads issued                 [compute 0   ][compute 1   ][compute 2   ]
+ ahead of time)                ▲ the wait for tile i+1 is hidden behind compute i
+```
+
+Both vendors do this. They differ in **where the tile waits** between the
+load and its use, and **how the threads know it has arrived**.
+
+**On NVIDIA (B300)**, kernels use a multi-stage pipeline in shared memory. TMA
+or `cp.async` copies tiles from global memory straight into shared memory,
+without going through registers. An mbarrier per stage says when a stage is
+full (data arrived) or free (consumers are done):
+
+```
+           producer (TMA)                         consumers (MMA warps)
+                │                                         ▲
+                ▼                                         │
+  shared mem: [ stage 0 ][ stage 1 ][ stage 2 ][ stage 3 ]   ring of stages
+              full/empty mbarrier per stage: the hardware signals "arrived"
+```
+
+**On MI355X**, our kernels use the **register file as the staging buffer**.
+Every thread issues buffer loads for a tile that will be used *later*. The
+values travel through the loop in registers. When their turn comes they are
+written to LDS, the workgroup synchronizes, and the MFMAs read the tile:
+
+```
+iteration i:   HBM ──buffer load──► registers          (tile i+d, arrives later)
+               registers (tile i, loaded d iterations ago) ──► LDS
+               ─── barrier ───
+               LDS ──► MFMA
+```
+
+| | B300 | MI355X (our kernels) |
+|---|---|---|
+| Copy engine | TMA / `cp.async`, global → shared directly | each thread's own buffer loads, global → registers |
+| Where the tile waits | shared memory stages | registers, carried through the loop |
+| "Data arrived" | mbarrier, set by hardware | `s_waitcnt` that the compiler puts before first use |
+| "Everyone can read it" | mbarrier phase | an ordinary workgroup barrier, **placed by you** |
+| Cost | shared memory per stage | registers per prefetched tile |
+
+The last two rows are what make this harder. Each prefetched tile uses
+registers, so you have to plan how many tiles to keep in flight. The
+barriers are not tied to the data, so you have to work out by hand where they
+are needed and where they are not.
+
+Sections 4.1 and 4.2 show the two loops. Section 4.3 shows a buffer-load
+feature that removes masks.
+
+### 3.1 GDN prefill: prefetch two chunks ahead, 3 barriers per chunk
+
+#### What the loop does
+
+Each workgroup walks its sequence chunk by chunk (section 1.2). It has 8
+waves in two groups of 4 (section 5). For every 64-token chunk it loads q, k,
+v and the gates from HBM, then does a lot of MFMA work in 4 phases. The two
+wave groups hand tiles to each other through LDS.
+
+#### Change: the prefetch rotates two register slots
+
+The loop carries the state slice and **two chunks of prefetched inputs** in
+its loop-carried values:
+
+```
+loop-carried values  =  [ state slice | inputs of chunk ch | inputs of chunk ch+1 ]
+                                         (already arrived)     (still in flight)
+```
+
+In each iteration the slots rotate:
+
+```
+iteration ch
+  phase 0   store "inputs of ch" registers → LDS          ← these registers are now free
+  phase 1   issue loads for chunk ch+2 into them         ← nxt = pre_next + _prefetch(ch + 2)
+  ...
+  yield     [ new state | inputs of ch+1 | inputs of ch+2 ]
+
+iteration ch+1
+  phase 0   store "inputs of ch+1" → LDS                  (loaded one iteration ago)
+  ...
+```
+
+The code:
 
 ```python
 # aiter/ops/flydsl/kernels/gdr_prefill/gdn_fused_prefill.py
@@ -383,35 +1009,97 @@ for i_t, state in range(fx.Int64(0), fx.Int64(NT), fx.Int64(1), init=s_init + pr
     results = yield new_s + nxt
 ```
 
-Where the barriers go:
+Why it is built this way:
 
-- **After the registers → LDS store, before the first MFMA (1).** All 8 waves
-  read the whole q/k tile, but each thread wrote only its own slice.
-- **Between phases that hand tiles from one wave group to the other (2, 3).**
+- **Issue the loads in phase 1, not earlier.** Only after phase 0 has stored
+  chunk `ch`'s q/k into LDS are those registers free. Reusing them for chunk
+  `ch + 2` means the register count does not grow.
+- **Two chunks ahead, not one.** Loads issued in phase 1 of chunk `ch` are
+  needed in phase 0 of chunk `ch + 2`. In between are phases 1–3 of `ch` *and*
+  all of `ch + 1`, almost two chunk steps of MFMA work to hide the HBM latency.
+  With only one chunk ahead, there would be just phases 1–3 of one chunk.
+- **The wait is automatic.** The compiler puts the `s_waitcnt` for a load just
+  before its first use, which is two iterations later. By then the data has
+  usually arrived, so the wait costs nothing.
+
+#### Where the barriers go
+
+The two wave groups work on different tiles in the same phase, and hand
+results to each other through LDS:
+
+```
+             group 0 (waves 0-3)                group 1 (waves 4-7)
+phase 0      all 8 waves: gates, norms, q/k registers → LDS
+═════════════════════════ barrier (1) ═════════════════════════
+phase 1      diag A, inverse, RHS               q·Sᵀ, A tiles
+             (+ every wave issues the loads for chunk ch+2)
+═════════════════════════ barrier (2) ═════════════════════════
+phase 2      Tinv row block, vnew      ◄──►     Pᵀ tiles
+═════════════════════════ barrier (3) ═════════════════════════
+phase 3      state update (reads k)             output
+             (no barrier here)
+                     │
+                     ▼  next iteration, phase 0
+```
+
+- **Barrier (1): after the registers → LDS stores, before the first MFMA.**
+  Each thread stored only its own slice of q/k, but every wave reads the whole
+  tile.
+- **Barriers (2) and (3): between phases that hand tiles across groups.**
   Group 0 writes the inverse and `vnew` that group 1 reads, and the other way
   round.
-- **Not at the end of the iteration.** Without double buffering we would need
-  a fourth barrier there. The next phase 0 would overwrite the k tile while
-  phase 3 of the slower waves still reads it. Every other single-buffered tile
-  (q, v, the per-token factors) is last read before barrier (3), so only k
-  needs two buffers. That makes 3 barriers per chunk instead of 4.
-- **Issue the next loads after phase 0.** By then chunk `ch`'s q/k registers
-  have been stored to LDS and are free, so chunk `ch + 2` reuses them and the
-  register count doesn't grow. The loads overlap with all the MFMA work of
-  phases 1–3. The compiler puts the wait for a load (`s_waitcnt`) just before
-  its first use, which is two iterations later, so by then the data has
-  usually arrived.
-- **No barrier when LDS is private to one wave.** In QSA each wave stages its
-  V tile in its own LDS region and is the only one that reads it back. Inside
-  one wave, LDS accesses complete in order, so the main loop has no barrier at
-  all. QSA needs barriers only in the prologue (slots and Q staged by all
-  threads) and in the epilogue, where the four waves merge their results and
-  reuse the V region.
+- **No barrier at the end of the iteration.** That would be a fourth barrier.
+  It is not needed because of the k double buffer (next part).
 
-QSA prefetches the next 16-token K/V tile into registers in the same way.
-On the last trip it reloads its own tile (it's already in cache) instead of
-branching around the prefetch. Q is kept in LDS to free registers for the
-prefetch:
+#### Why k is double-buffered, and only k
+
+Without a barrier at the end, a fast wave can start the next iteration while a
+slow wave is still in phase 3:
+
+```
+single k buffer:
+
+  slow wave   ... phase 3 of ch: reading k(ch) from LDS[k] ...
+  fast wave   ... phase 0 of ch+1: writing k(ch+1) to LDS[k]     ✗ overwrites data
+                                                                   still being read
+two k buffers, picked by ch % 2:
+
+  slow wave   ... phase 3 of ch:   reads  LDS[k, buffer 0]
+  fast wave   ... phase 0 of ch+1: writes LDS[k, buffer 1]        ✓ no conflict
+```
+
+Two buffers are always enough. The fast wave cannot get past barrier (1) of
+`ch + 1` until the slow wave arrives there too, so the waves are never more
+than one iteration apart.
+
+Only k needs this, because only k is read in phase 3. Every other tile that
+phase 0 writes (q, v, the per-token factors) is last read before barrier (3).
+When a fast wave writes them again in the next phase 0, every wave has
+already passed barrier (3), so nobody still reads them.
+
+Result: **3 barriers per chunk instead of 4**, for the cost of one extra
+64 × 136 bf16 k tile in LDS.
+
+### 3.2 QSA sparse decode: prefetch one tile ahead, no barrier in the loop
+
+#### What the loop does
+
+Each workgroup of 4 waves handles one split of KV positions (section 1.1).
+The waves take turns over the 16-token tiles:
+
+```
+split = 192 positions = 12 tiles of 16
+
+wave 0: tiles 0, 4, 8          wave i, iteration it → tile (i + it · 4)
+wave 1: tiles 1, 5, 9
+wave 2: tiles 2, 6, 10
+wave 3: tiles 3, 7, 11
+```
+
+#### Change: prefetch the next tile into registers
+
+While one tile is being computed, the K/V loads for the wave's next tile are
+already in flight:
 
 ```python
 # aiter/ops/flydsl/kernels/qsa/sparse_decode_attn.py
@@ -422,9 +1110,79 @@ next_it = (it_i32 + 1 < n_iters).select(it_i32 + 1, it_i32)
 prefetched = _load_tile((warp + next_it * NUM_WAVES) * TILE_TOKENS)
 ```
 
-**Use the out-of-bounds behavior.** A buffer load past the end returns 0,
-and a store past `num_records` is dropped. GDN uses this for the last chunk of
-each sequence, with no per-lane masks:
+```
+wave 0:   it = 0              it = 1              it = 2 (last)
+compute   tile 0              tile 4              tile 8
+prefetch  tile 4              tile 8              tile 8 again (cache hit, discarded)
+```
+
+- **Last trip: reload, don't branch.** On the last iteration there is no next
+  tile. Instead of an `if` around the prefetch, the wave loads its own tile
+  again. It is already in cache, so it is cheap, and the loop body stays the
+  same in every iteration.
+- **Q stays in LDS.** The prefetched K/V tile needs registers. Q is the same
+  for every tile, so it is kept in LDS and read from there (section 3.1), which
+  leaves the registers for the prefetch.
+
+#### Why the main loop needs no barrier
+
+A barrier is only needed when one wave reads LDS that **another** wave
+wrote. In QSA each wave stages its V tile in **its own** LDS region and is the
+only one that reads it back (for the transposed read of section 3.1). Inside
+one wave, LDS accesses complete in order, so no barrier is needed:
+
+```
+LDS layout of one workgroup
+
+  [ slots (all waves) ][ Q (all waves) ][ V wave 0 ][ V wave 1 ][ V wave 2 ][ V wave 3 ]
+   └─── written once in the prologue ──┘ └───────── private to each wave ──────────┘
+        → barrier after the prologue          → no barrier in the main loop
+
+epilogue: the 4 waves merge their partial results through the V region
+        → barriers again (the region is shared now)
+```
+
+So QSA has barriers only in the prologue (slots and Q are written by all
+threads and read by all) and in the epilogue (the waves merge their results
+and reuse the V region).
+
+Compare with GDN in 4.1: there the waves *must* share tiles, because the two
+groups split the work of one chunk, so barriers are needed. In QSA the waves
+work on different tokens and share nothing until the end.
+
+### 3.3 Use the out-of-bounds behavior of buffer loads and stores
+
+#### What a buffer access is
+
+On AMD, a buffer load or store goes through a **buffer descriptor**: a base
+address plus `num_records`, the size of the buffer. The hardware checks every
+access against that size:
+
+```
+descriptor: base ─────────────────► base + num_records
+            [  valid range                            ]  past the end:
+                                                         load  → returns 0
+                                                         store → dropped
+```
+
+So the end of a tensor is handled by the hardware, and the kernel needs no
+per-lane `if (row < n)` masks.
+
+#### GDN: the last chunk of a sequence
+
+Sequences are packed back to back, and a sequence's length is usually not a
+multiple of 64. So the last chunk runs past the end of the sequence:
+
+```
+packed tokens:   [ ········ seq 0 ········ | ······ seq 1 ······ ]
+seq 0 chunks:    [ chunk 0 ][ chunk 1 ][ chunk 2 ]
+                                       [ 40 rows | 24 rows      ]
+                                         seq 0     belong to seq 1
+```
+
+The output tile of the last chunk has 64 rows, but only 40 belong to seq 0.
+If the kernel wrote all 64, it would overwrite seq 1's output, which another
+workgroup writes. So the output descriptor is cut at the end of this sequence:
 
 ```python
 # aiter/ops/flydsl/kernels/gdr_prefill/gdn_fused_prefill.py
@@ -434,7 +1192,16 @@ o_rec = fx.Int64(T_local) * (H * VD * 2)
 o_it = _view(o_t, (bos64 * H + fx.Int64(i_h)) * VD + fx.Int64(i_v) * BV, o_rec)
 ```
 
-HC uses the same rule to pad decode rows up to the 16-row MFMA tile:
+```
+o descriptor:  base = row bos of seq 0, num_records = T_local rows
+               [ rows of seq 0 ]  rows 40..63 of the last chunk → stores dropped
+```
+
+#### HC: pad the decode rows to the 16-row tile
+
+An MFMA always works on 16 rows (section 3), but at decode there may be only
+1–3 rows. The rows past `M` must read as zero. HC points them at the first
+address past the end of the activations, so the hardware returns 0:
 
 ```python
 # python/sglang/kernels/ops/gemm/hc_fused_flydsl.py
@@ -443,132 +1210,38 @@ def a_offset(row, kcol):
     return (row < M).select(fx.Int32(row * K + kcol), fx.Int32(M * K))
 ```
 
-## 5. Rewrite the warp-level code for wave64
+```
+activations, M = 3 real rows, MFMA tile = 16 rows
 
-- **Warp 32 → wave 64.** Every `__shfl_xor` reduction, lane index map and
-  "one warp per row" assumption changes.
-- **Use DPP for row reductions and scans.** GDN computes the in-chunk
-  cumulative decay over 64 tokens with DPP instead of a chain of shuffles:
-
-  ```python
-  # aiter/ops/flydsl/kernels/gdr_prefill/gdn_fused_prefill.py
-  def _wave_scan(x):
-      """Inclusive wave64 prefix sum (gfx9 DPP row_shr + row_bcast)."""
-      s = x
-      for i in range(4):
-          s = s + _dpp_f32(s, 0x110 + (1 << i))  # row_shr
-      s = s + _dpp_f32(s, 0x142, row_mask=0xA)  # row_bcast:15
-      return s + _dpp_f32(s, 0x143, row_mask=0xC)  # row_bcast:31
-  ```
-
-- **Keep wave-uniform values in scalar registers:**
-
-  ```python
-  # Wave index as a scalar so per-wave selects and addresses stay in SGPRs.
-  w = fx.Int32(rocdl.readfirstlane(T.i32, (tid // WAVE).ir_value()))
-  ```
-
-- **Warp specialization.** gfx950 has no `setmaxnreg` and no async barriers.
-  GDN uses two wave groups, with one wave of each group on every SIMD, so both
-  groups issue MFMAs at the same time:
-
-  ```python
-  # Two wave groups of four (one wave of each per SIMD): group 0 owns the state
-  # slice and the triangular inverse, group 1 the q-side tiles and the output.
-  NUM_WAVES = 8
-  GROUP = 4
-  ```
-
-## 6. Plan for 160 KB LDS
-
-gfx950 has 160 KB LDS per CU. B300 has up to 228 KB of shared memory per SM,
-plus 256 KB of TMEM for accumulators. Tiles sized for B300 may not fit, or
-may fit only one workgroup per CU, as in GDN. That brings you back to rule 1.
-Pad the LDS rows against bank conflicts:
-
-```python
-# aiter/ops/flydsl/kernels/gdr_prefill/gdn_fused_prefill.py
-# Row pitch of the [token][K] and [V][K] bf16 LDS tiles; the 8-element pad
-# shifts consecutive rows by 4 banks so a 16-row b128 operand read is
-# conflict-free.
-ROW = KD + 8
+row  0  [ real data ]  ◄── offset row·K + kcol
+row  1  [ real data ]
+row  2  [ real data ]
+row  3  [ 0 0 0 ... ]  ◄── offset M·K = first byte past the end → load returns 0
+ ...
+row 15  [ 0 0 0 ... ]
 ```
 
-## 7. Don't lose the gain on the host
+The padded rows give zero results, which are never stored. There is no
+branch, and every lane runs the same code.
 
-FlyDSL specializes each kernel at compile time (GQA group, top-k, dtypes, row
-count). That is good for the kernel, but every new shape is a new compile, and
-calling the JIT function re-traces it every time. The HC kernels handle both
-problems:
+### 3.4 Summary of section 4
 
-```python
-# python/sglang/kernels/ops/gemm/hc_fused_flydsl.py
-def _bucket_rows(m):
-    """M is a Constexpr, so each distinct row count is a compile. Round up to a power of
-    two within the first MFMA tile, then to whole tiles: the kernels already compute
-    whole tiles, so padding adds no MFMA work and M = 1 stays exact."""
-    if m <= _MFMA_M:
-        return 1 << (m - 1).bit_length()
-    return -(-m // _MFMA_M) * _MFMA_M
-
-# Calling a JitFunction re-traces it to MLIR on every call, which costs far more than the
-# kernels outside CUDA graphs; dispatch a CompiledFunction per Constexpr set instead.
-_compiled = {}
+```
+                    NVIDIA habit                     MI355X rewrite
+staging buffer      shared-memory stages (TMA)       registers, carried through the loop
+"data arrived"      mbarrier per stage               s_waitcnt, placed by the compiler
+"safe to read"      mbarrier phase                   workgroup barrier, placed by you
+GDN chunk loop      multi-stage TMA pipeline         2 chunks ahead, 3 barriers,
+                                                     k double-buffered
+QSA tile loop       multi-stage TMA pipeline         1 tile ahead, wave-private LDS,
+                                                     no barrier in the loop
+tails and padding   TMA OOB fill / masks             buffer descriptor: OOB load = 0,
+                                                     OOB store dropped
 ```
 
-Also keep everything CUDA-graph safe. The QSA split count is fixed per batch
-size, and the workspace is allocated once in SGLang:
-
-```python
-# python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
-# Sized once for every captured batch: graphs keep raw pointers to it, so
-# it is never reallocated. A larger eager batch gets a per-call workspace.
-if self._flydsl_decode_workspace is None:
-    capacity = max(
-        partials,
-        flydsl_decode.workspace_partials(
-            self._cuda_graph_max_tokens, num_q_heads, num_kv_heads, topk, device
-        ),
-    )
-```
-
-## What you can keep
-
-The algorithm, online softmax, chunked recurrences and the algebraic fusions
-all carry over. Keep the existing path as the fallback. Each of our kernels
-checks its operands and sends everything else to the old path:
-
-```python
-# python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
-flydsl_decode = _resolve_flydsl_sparse_decode()
-if flydsl_decode is not None and flydsl_decode.can_use_flydsl_qsa_sparse_decode(
-    q, k_buffer, v_buffer
-):
-    return self._forward_flydsl_fused_sparse(...)
-# everything else: the existing Triton gather + decode
-```
-
-Validate against an fp32/fp64 reference rather than bit-exactness. All three
-rewrites came out within 1 bf16 ulp of the old path or more accurate than it.
-For example, the QSA relative L2 error went from 4–6e-3 to 1.7e-3, and GSM8K
-did not change.
-
-## Checklist
-
-1. Does the grid fill 256 CUs at your real decode batch? If not, split the
-   KV or K dimension, with the split count taken from the CU count.
-2. Are there gather, scatter or staging passes around the main kernel? Fuse
-   them in.
-3. Is the MMA mapping written for MFMA 16×16 tiles, with accumulators chained
-   from one MFMA to the next?
-4. Are TMA pipelines replaced with register prefetch and buffer loads? Is
-   there a barrier after every shared LDS tile is written, and is the tile
-   that the last phase still reads double-buffered?
-5. Are the reductions and lane maps written for wave64?
-6. Does the LDS use fit in 160 KB, and is it padded against bank conflicts?
-7. Are the kernels cached and CUDA-graph safe, with a fallback for the shapes
-   where the new kernel loses?
-
+The rule: decide for every LDS tile who writes it and who reads it. Put a
+barrier only where a wave reads another wave's data. Double-buffer a tile
+when skipping a barrier would let a fast wave overwrite it.
 
 
 ### Monokernel
