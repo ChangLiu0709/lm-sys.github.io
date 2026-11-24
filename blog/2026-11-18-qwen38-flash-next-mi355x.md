@@ -82,7 +82,7 @@ length of 1. At batch 8:
 | Level | Before (Triton) |
 |---|---|
 | Grid | rows × KV heads = **16 workgroups** |
-| Workgroup | **8 waves**, from `_L20_CONFIGS` (chosen because the device name is not "H20") |
+| Workgroup | **8 waves** |
 | Tile | **16 rows × 32 tokens** (12 GQA heads padded to 16) |
 | Loop | **65 steps** of 32 positions per workgroup |
 
