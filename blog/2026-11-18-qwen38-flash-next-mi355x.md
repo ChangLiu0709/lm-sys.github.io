@@ -86,257 +86,111 @@ The code below is taken from these PRs. Lines marked `...` are left out.
 
 ## 1. Kernel shape: QSA sparse decode did not fit the GPU
 
-MI355X has **256 CUs**. A kernel is fast only if it gives every CU work for
-about the same time. The QSA decode kernel we started from was shaped by the
-problem, not by the GPU, and at decode the problem is small.
-
-### What the kernel computes
-
-At decode, each **row** is one query token: the next token of a request, or
-one MTP draft token being verified. For one row at TP1:
-
-```
-Q          24 query heads × 256 (head dim)
-           ├─ q heads  0..11 ──► KV head 0     GQA: 12 query heads
-           └─ q heads 12..23 ──► KV head 1          share one KV head
-
-K, V       per KV head: 2,051 selected positions × 256
-           (indexer: 512 blocks × 4 tokens + up to 3 recent tokens)
-
-output     24 × 256
-```
-
-So the kernel has three dimensions: **rows** (1 to 128 at decode), **KV
-heads** (only 2) and **positions** (2,051). Where each one goes, into the
-grid, the workgroup, the tile or the loop, decides how fast the kernel is.
+MI355X has **256 CUs**, and a kernel is fast only if every CU has work. At
+decode, each row is one query token: 24 query heads (12 per KV head, GQA)
+attend to 2,051 selected positions of their KV head. So the kernel has three
+dimensions: **rows** (1–128), **KV heads** (2) and **positions** (2,051).
 
 ### Before: a prefill kernel reused for decode
 
-The ROCm path ran the Triton kernel `_sparse_gqa_chunk_prefill`, a sparse
-*prefill* kernel, with a query length of 1. At batch 8 its shape is:
+ROCm ran the Triton *prefill* kernel `_sparse_gqa_chunk_prefill` with a query
+length of 1. At batch 8:
 
-| Level | Before (Triton) | Where it comes from |
-|---|---|---|
-| Grid | 1 × (rows × KV heads) = **16 workgroups** | one workgroup per (row, KV head); the first grid dimension is the query tile, always 1 at decode |
-| Workgroup | **8 waves** (512 threads) | config table `_L20_CONFIGS`: up to 32 rows → 32 tokens per step, 8 warps, 2 stages |
-| Tile | **16 rows × 32 tokens** | the 12 heads of a GQA group padded to 16 rows |
-| Loop | 2,051 / 32 = **65 steps** per workgroup | all positions of one (row, KV head) are walked by one workgroup |
+| Level | Before (Triton) |
+|---|---|
+| Grid | rows × KV heads = **16 workgroups** |
+| Workgroup | **8 waves**, from `_L20_CONFIGS` (chosen because the device name is not "H20") |
+| Tile | **16 rows × 32 tokens** (12 GQA heads padded to 16) |
+| Loop | **65 steps** of 32 positions per workgroup |
 
-```
-grid = 8 rows × 2 KV heads = 16 workgroups of 512 threads
+Three problems:
 
-                 positions 0 ─────────────────────────────────────► 2050
-row 0, kv 0    [ WG: 65 steps × 32 tokens, one after another          ]
-row 0, kv 1    [ WG: 65 steps × 32 tokens                             ]
-   ...
-row 7, kv 1    [ WG: 65 steps × 32 tokens                             ]
+1. **The grid follows the problem, not the GPU.** 16 of 256 CUs work at
+   batch 8, and 2 at batch 1. Only 2 KV heads makes it worse.
+2. **The only large dimension is a loop.** Each workgroup walks all 2,051
+   positions, so the kernel takes 65 steps whatever the batch.
+3. **The tile was sized for another GPU.** A 16-row tile is one MFMA tile, so
+   the 8 waves cannot split it: all of them compute the same scores (the same
+   mistake as in part 2).
 
-┌────────────────────────────────┐
-│■■■■■■■■■■■■■■■■□□□□□□□□□□□□□□□□│   ■ busy CU   □ idle CU
-│□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□│   16 of 256 CUs work; each streams
-│   ... 8 rows × 32 = 256 CUs     │   2.1 MB of K/V through one CU
-└────────────────────────────────┘
-```
+### After: split-KV, grid computed from the CU count
 
-Three things are wrong with this shape:
+The FlyDSL kernel cuts each row's positions into `num_splits` pieces, one
+workgroup each. Each workgroup writes a partial result (`O`, max `m`, sum
+`l`), and a small reduce kernel merges them as online softmax does.
 
-1. **The grid is set by the problem, not by the GPU.** rows × KV heads is
-   tiny at decode, and Qwen3.8 has only 2 KV heads: a model with 8 KV heads
-   would get 4× more workgroups from the same rows. At batch 1 the kernel
-   launches 2 workgroups on 256 CUs.
-2. **The only large dimension is a loop.** The 2,051 positions are walked
-   inside one workgroup, 32 at a time. The kernel takes as long as one
-   workgroup needs for 65 steps, however many rows there are.
-3. **The workgroup and tile were sized for another GPU.** The table is
-   picked by device name: `_H20_CONFIGS` if the name contains "H20", else
-   `_L20_CONFIGS`. On MI355X it is always the L20 table. It gives 8 waves to a
-   tile that is only 16 rows tall, a single MFMA tile, so the waves cannot
-   split the rows. In fact all 8 compute the same score tile; part 2 shows
-   the same mistake in the HC kernel.
-
-### After: the grid is computed from the CU count (split-KV)
-
-The new FlyDSL kernel moves part of the position loop into the grid. Each
-row's 2,051 positions are cut into `num_splits` pieces, and each piece gets
-its own workgroup. A workgroup cannot write the final output, because it sees
-only part of the softmax, so it writes a partial result per head (the
-unnormalized output `O`, its max score `m` and its sum `l`). A small reduce
-kernel then merges the partials the same way online softmax merges blocks.
-
-| Level | After (FlyDSL) |
+| Level | After (FlyDSL), batch 8 |
 |---|---|
 | Grid | rows × KV heads × `num_splits` = 8 × 2 × 11 = **176 workgroups** |
-| Workgroup | **4 waves** (256 threads) |
-| Tile | each wave: **16 tokens × 16 heads** (12 + 4 padding), one 16 × 16 × 32 MFMA tile |
+| Workgroup | **4 waves** |
+| Tile | per wave **16 tokens × 16 heads**, one 16 × 16 × 32 MFMA tile |
 | Loop | 192 positions per split = **3 rounds** of 4 waves × 16 tokens |
 
-```
-grid = 8 rows × 2 KV heads × 11 splits = 176 workgroups of 256 threads
+Tokens now sit on the 16-row side of the tile, so each wave has its own work.
+`num_splits` is chosen at run time: aim for one workgroup per CU, keep at
+least 128 positions per split (below that, workgroup startup dominates), and
+round to whole 64-position rounds. It depends only on the batch size, so it is
+fixed per captured CUDA graph.
 
-                 split 0    split 1    split 2          split 10
-                 0..191     192..383   384..575   ...   1920..2050
-row 0, kv 0    [  WG    ][  WG     ][  WG     ]  ...  [  WG     ]  ──► 11 partials
-   ...
-row 7, kv 1    [  WG    ][  WG     ][  WG     ]  ...  [  WG     ]  ──► 11 partials
 
-inside one workgroup (one split = 3 rounds):
-
-            wave 0     wave 1     wave 2     wave 3
-round 0   [ 0..15  ] [ 16..31 ] [ 32..47 ] [ 48..63  ]
-round 1   [ 64..79 ] [ 80..95 ] [ 96..111] [112..127 ]
-round 2   [128..143] [144..159] [160..175] [176..191 ]
-```
-
-Tokens now sit on the 16-row side of the tile, so each wave owns its own 16
-tokens and no wave repeats another's work.
-
-`num_splits` is computed at run time with three rules:
-
-| Rule | Why |
-|---|---|
-| aim for one workgroup per CU | more workgroups than CUs does not help: each extra split adds a prologue and one more partial to merge |
-| at least 128 positions per split | that is 2 tiles per wave; below it, the fixed cost of starting a workgroup is larger than the gain |
-| round each split up to whole 64-position rounds | a partial round would leave waves idle |
-
-What that gives at each batch size, with the CU utilization of the attention
-kernel measured by rocprof-compute (metric 2.1.33). Batch size here is the
-number of decode rows, one query token per request:
-
-| Batch size | `num_splits` | Positions per split | Workgroups before → after | CU Utilization before → after |
-|---:|---:|---:|---:|---:|
-| 1 | 17 | 128 | 2 → 34 | 0.7% → 7.9% |
-| 2 | 17 | 128 | 4 → 68 | 1.4% → 15.2% |
-| 4 | 17 | 128 | 8 → 136 | 2.7% → 31.9% |
-| 8 | 11 | 192 | 16 → 176 | 5.4% → 45.7% |
-| 16 | 7 | 320 | 32 → 224 | 10.8% → 59.4% |
-| 32 | 4 | 576 | 64 → 256 | 20.7% → 71.1% |
-| 64 | 2 | 1,088 | 128 → 256 | 41.2% → 78.3% |
-| 128 | 1 | all 2,051 | 256 → 256 | 88.5% → 84.1% |
-
-At batch 128 the old grid already fills the GPU, so nothing is split, the
-reduce kernel is skipped, and the CU utilization is the same as before. The
-new kernel is still 1.4× faster there: its waves no longer repeat each
-other's work, and it reads the selected K/V straight from the cache pool
-instead of from a copy that a separate gather kernel made. The split count
-depends only on the batch size, so it is fixed for each captured CUDA graph.
-
-### rocprof: before and after
-
-**The attention kernel, batch 8 at 32K context** (rocprof-compute blocks 2
-and 7):
-
-![QSA attention kernel, rocprof-compute blocks 2 and 7](images/shape_qsa_counters.png)
-
-Before: 8,192 work items in workgroups of 512, so 16 workgroups and 128
-wavefronts. On average only 303 of the GPU's 8,192 wave slots are in use, and
-**CU Utilization is 5.4%**. After: 45,056 work items in workgroups of 256, so
-176 workgroups and 704 wavefronts, 2,834 wave slots in use, **CU Utilization
-46.6%**.
-
-**The same kernel at batch sizes 1 to 128.**
+At batch 8: 16 workgroups, 128 wavefronts and **5.4% CU Utilization** before;
+176 workgroups, 704 wavefronts and **46.6%** after.
 
 ![QSA attention kernel CU utilization vs batch](images/shape_qsa_batch.png)
 
-Before, CU utilization simply follows the workgroup count: 2 workgroups give
-0.7%, 16 give 5.4%, and the GPU is only filled at batch 128, where the grid
-reaches 256 workgroups. Most real decode batches are far below that. After,
-the grid is sized to the GPU at every batch: 46% at batch 8 and over 70% from
-batch 32 on. At batch 1 it is still only 8%, because the 128-position minimum
-per split caps the grid at 34 workgroups.
+Before, CU utilization follows the workgroup count and reaches the full GPU
+only at batch 128. After, it is 46% at batch 8 and over 70% from batch 32. At
+batch 1 it stays at 8%: the 128-position minimum caps the grid at 34
+workgroups.
 
-### Takeaway
+At batch 128 nothing is split and the reduce is skipped, but the new kernel is
+still 1.4× faster: no duplicated waves, and it reads K/V straight from the
+cache pool instead of from a gathered copy.
 
-At decode, the problem shape (rows × heads) is far smaller than 256 CUs, and
-few KV heads make it smaller still. Compute the grid from the CU count at run
-time, move part of the long loop into the grid, and size the workgroup and
-the tile for MFMA instead of inheriting a config table from another GPU. In
-rocprof, check **Grid Size** and **CU Utilization**, and measure them at the
-batch sizes you actually serve, not only at the largest one: a grid that
-fills the GPU only at batch 128 leaves it mostly idle at batch 8.
+**Takeaway:** compute the grid from the CU count, move part of the long loop
+into the grid, and size waves and tiles for MFMA. Check **Grid Size** and
+**CU Utilization** at the batch sizes you actually serve, not only the largest.
 
 ## 2. MMA: the HC mix issued 4.5× too many MFMAs ([sglang#48648](https://github.com/sgl-project/sglang/pull/48648))
 
-Around every block, a hyper-connection (HC) site mixes the model's four
-residual streams (4 × 2,560 = 10,240 values per row) into the block's input
-with two GEMVs: **down** to 320 values, then **up** back to 10,240. At batch 1
-that is about 13 MB of weights and almost no math, done on MFMA with the
-single row padded to a 16-row tile. On ROCm both GEMVs ran in one generic
-Triton kernel, `_hc_mix_persistent_kernel`.
-[sglang#48648](https://github.com/sgl-project/sglang/pull/48648) replaces it
-with FlyDSL kernels built for MFMA.
+The HC site mixes four residual streams (10,240 values per row) with two
+GEMVs: **down** to 320 values and **up** back to 10,240. At batch 1 that is
+about 13 MB of weights and almost no math, with the single row padded to a
+16-row MFMA tile. On ROCm both GEMVs ran in one persistent Triton kernel,
+`_hc_mix_persistent_kernel`, with **8 waves**.
 
 ### Why the old kernel issued so many MFMAs
 
-Triton turns each matrix product (`tl.dot`) into MFMAs and hands the 16 × 16
-output tiles to the waves of the workgroup. It does not split the `k`
-dimension between waves, so a product can keep at most as many waves busy as
-its output has 16 × 16 tiles. Any extra wave gets a copy of a tile that
-another wave already computes.
-
-The old kernel runs both GEMVs in one persistent launch, so it has one wave
-count for both: **8 waves** per workgroup. That fits the up GEMV and not the
-down GEMV:
+Triton gives each wave 16 × 16 output tiles of a `tl.dot` and does not split
+`k`, so extra waves compute copies. One wave count served both GEMVs:
 
 ```
-up GEMV    output per step: 16 rows × 128   = 8 MFMA tiles
-           wave 0 │ wave 1 │ wave 2 │ ... │ wave 7        8 waves, 8 different tiles   ✓
-
-down GEMV  output per tile: 16 rows × 32    = 2 MFMA tiles
-           waves 0–7 are laid along the 16 rows (warpsPerCTA = [8, 1]),
-           and 16 rows are one tile:  every wave computes both tiles     8 copies   ✗
+up GEMV    16 rows × 128 per step = 8 MFMA tiles   → 8 waves, 8 different tiles   ✓
+down GEMV  16 rows × 32  per tile = 2 MFMA tiles   → every wave computes both     8 copies ✗
 ```
 
-Each down tile (k = 256) needs 2 × 8 = 16 MFMAs; with 8 copies it issues 128.
-Over the 400 down tiles that is 51,200 MFMAs instead of 6,400. With the up
-GEMV (6,400, no copies), the kernel issues **57,600 MFMAs where 12,800 are
-needed**. That is exactly the count rocprof-compute reports:
+The down GEMV issues 51,200 MFMAs instead of 6,400. With the up GEMV, that is
+**57,600 MFMAs where 12,800 are needed**, exactly what rocprof-compute reports:
 
 ![HC Triton mix kernel, batch 1, rocprof-compute](images/mma_hc_before.png)
 
-### Why that is bad
-
-The matrix cores do not mind: MFMA utilization is under 1%, before and after.
-A batch-1 GEMV is limited by memory. The cost of the copies is in the waves:
-
-- **Every copy needs its own operands.** The weights are row-major, so each
-  tile is loaded from HBM, written to LDS and read back in the MFMA layout,
-  and each of the 8 waves reads the whole tile back for its own copy. Most of
-  the 136,703 LDS instructions are those repeated reads.
-- **The waves wait instead of loading.** The kernel spends 120 M wave-cycles
-  per site, and 114 M of them (95%) waiting for a dependency: an LDS read, an
-  MFMA result, or a load. The 8 waves of a workgroup move one tile at the
-  pace of all that repeated work, and the weights arrive at **430 GB/s** on a
-  GPU with 8 TB/s.
-
-```
-per down tile:   HBM ──► registers ──► LDS ──► 8 × (LDS read ──► 16 MFMAs)   → same result 8 times
-```
+The matrix cores are not the bottleneck (MFMA utilization stays under 1%; a
+batch-1 GEMV is memory-bound). The copies cost waves: each one reads its tile
+back from LDS (most of the 136,703 LDS instructions), 95% of the 120 M
+wave-cycles are spent waiting, and the weights arrive at **430 GB/s** on a GPU
+with 8 TB/s.
 
 ### How we reduced it
 
-The PR gives every wave its own tile, and lets each wave load its operand
-directly:
-
-- **One kernel per GEMV, each with its own wave shape.** The down GEMV runs
-  on 704 one-wave workgroups: 22 row tiles × 32 splits of `k`. The `k`
-  dimension is split across workgroups instead of copied across waves, and a
-  small reduce kernel adds the 32 partial sums. The up GEMV runs on 640 waves,
-  one 16-column tile each.
-- **Weights in MFMA fragment order.** Once, at load time, each 16 × 32 weight
-  fragment is packed into one contiguous 1 KB block, lane by lane. One
-  16-byte load per lane then *is* the MFMA operand, straight from HBM into
-  registers: no LDS in the down GEMV, and each wave has its 10 fragments in
-  flight before its first MFMA.
-- **The rest of the site rides along.** The per-stream RMSNorm is folded into
-  the packed weights and the reduce, and the combine's inject GEMV is one more
-  row tile of the down GEMV (the 21st; the 22nd computes the norm statistics).
-
-```
-packed weights:  [ tile ][ k-step ][ lane 0: 16 B | lane 1: 16 B | ... | lane 63: 16 B ]  = 1 KB
-
-down:  22 tiles × 32 k-splits × 10 k-steps = 6,720 MFMAs, one wave each, no LDS
-up:    640 tiles × 10 k-steps              = 6,400 MFMAs
-```
+- **One kernel per GEMV, each with its own wave shape.** Down: 704 one-wave
+  workgroups (22 row tiles × 32 splits of `k`) plus a small reduce kernel. Up:
+  640 waves, one 16-column tile each.
+- **Weights packed in MFMA fragment order** at load time (1 KB per 16 × 32
+  fragment). One 16-byte load per lane *is* the MFMA operand, straight from
+  HBM to registers, with no LDS in the down GEMV.
+- **The rest of the site rides along.** The RMSNorm is folded into the packed
+  weights and the reduce; the inject GEMV becomes one more row tile of the
+  down GEMV.
 
 ### Result
 
@@ -351,24 +205,20 @@ up:    640 tiles × 10 k-steps              = 6,400 MFMAs
 
 ![HC kernel trace, before and after](images/mma_hc_trace.png)
 
-The whole site drops from 43.5 to **16.0 µs** at batch 1. It is still 4
-kernels, but the 31.8 µs mix is now three small kernels, and the separate
-norm and inject GEMV are gone. The PR measures 3.0× per site at M = 1 down to
-1.4× at M = 128, and **+14.9% P90 interactivity, +5.6% throughput** end to end.
+The site drops from 43.5 to **16.0 µs** at batch 1 (still 4 kernels: the mix
+became three small ones, the separate norm and inject are gone). The PR
+measures 3.0× per site at M = 1 down to 1.4× at M = 128, and **+14.9% P90
+interactivity, +5.6% throughput** end to end.
 
-**Takeaway:** a matrix product can only keep as many waves busy as it has
-16 × 16 output tiles. Size the waves per product, not per kernel, and split
-`k` across workgroups when one tile is all there is. In rocprof, compare the
-MFMA count with one MFMA per tile and `k` step: a multiple of the wave count
-means the waves are computing copies.
+**Takeaway:** a matrix product keeps busy only as many waves as it has 16 × 16
+output tiles. Size the waves per product, and split `k` across workgroups when
+there is only one tile. In rocprof, an MFMA count that is a multiple of the
+needed one means the waves compute copies.
 
 ## 3. Memory: GDN prefill moved its intermediates through HBM
 
-### What the kernel computes
-
-A GDN layer keeps a 128 × 128 state per value head instead of a KV cache. In
-prefill, the tokens are cut into chunks of 64 (512 chunks at 32K tokens), and
-for every chunk and head:
+A GDN layer keeps a 128 × 128 state per value head. In prefill, tokens are cut
+into chunks of 64 (512 chunks at 32K), and for every chunk and head:
 
 ```
 1. normalize q, k
@@ -379,29 +229,16 @@ for every chunk and head:
 6. o    = output from q, k, S, u                     64 × 128
 ```
 
-Only the inputs (q, k, v and the gates) and the output o have to touch HBM.
-At 32K tokens that is about 0.7 GB to read and 0.4 GB to write per layer.
-Everything else is an intermediate.
+Only the inputs and the output o must touch HBM: about 0.7 GB read and 0.4 GB
+written per layer at 32K tokens.
 
 ### Before: one kernel per stage
 
-The Triton path runs 9 kernels per layer: a copy and an l2norm for q and for
-k (step 1), then one kernel each for steps 2, 3, 4, 5 and 6. Each kernel
-works on all 512 chunks and writes its whole result to HBM, and the next
-kernel reads it back.
-
-The worst of these is the state:
-
-- The state scan (step 5) has to walk the chunks in order. It runs on only 384
-  workgroups, and it writes the state of **every** chunk to HBM, so that the
-  output kernel (step 6) can read them back. With the corrected values it
-  also hands to step 6, it writes 1.2 GB (the 512 chunk states alone are
-  0.8 GB) and reads 6.2 GB.
-- Every kernel starts cold. A load from HBM takes many hundreds of cycles,
-  and with one stage per kernel there is little other work in the same
-  kernel to hide it behind.
-
-Measured per kernel with rocprof-compute (block 17, bandwidth × kernel time):
+The Triton path runs 9 kernels per layer, one per stage. Each writes its whole
+result to HBM and the next reads it back. The worst is the state scan (step
+5): it writes the state of **every** chunk so the output kernel can read them,
+runs on only 384 workgroups, and every kernel starts cold with little work to
+hide HBM latency.
 
 | Kernel | Step | Time | Read | Written |
 |---|---|---:|---:|---:|
@@ -413,134 +250,41 @@ Measured per kernel with rocprof-compute (block 17, bandwidth × kernel time):
 | output o | 6 | 0.47 ms | 2.8 GB | 0.4 GB |
 | **total** | | | **11.0 GB** | **3.3 GB** |
 
-(The two copy kernels are not counted.)
+(rocprof-compute block 17; the two copy kernels are not counted.)
 
 ### After: one kernel, intermediates on chip
 
-The fused FlyDSL kernel runs all six steps for all chunks in one launch:
-
-- **192 workgroups of 8 waves.** Each owns one head and a 32-column slice of
-  its state (48 heads × 4 slices) and walks the chunks of its sequence in
-  order.
-- **The state stays in registers** for the whole sequence and is written to
-  HBM once, at the end. `A`, `T`, `w`, `u` live in registers and LDS (91 KB
-  per workgroup) and never reach HBM. Per chunk, only the output o is
-  written.
-- **The next inputs are already on the way.** While a workgroup computes
-  chunk `ch`, the loads for chunk `ch + 2` are in flight into registers, so
-  almost two chunk steps of compute hide each load. The registers are reused:
-  the loads are issued only after chunk `ch`'s inputs have been stored to
-  LDS.
-- **The end of a sequence costs nothing.** The last chunk usually runs past
-  the end of its sequence. The output's buffer descriptor ends at the
-  sequence end, so the hardware drops the stores past it, with no masks.
+- **192 workgroups of 8 waves**, each owning one head and a 32-column slice of
+  its state, walking the chunks in order.
+- **State in registers**, written to HBM once at the end. `A`, `T`, `w`, `u`
+  stay in registers and LDS; per chunk only o is written.
+- **Prefetch two chunks ahead**, so the loads hide behind compute.
+- **No masks at the sequence end**: the output buffer descriptor ends there,
+  and the hardware drops stores past it.
 
 ```
 before:  q,k ─► [l2norm] ─HBM─► [kkᵀ] ─HBM─► [inverse] ─HBM─► [w,u] ─HBM─► [state scan] ─HBM─► [output] ─► o
-                                                                           (all 512 states)
-
-after:   q,k,v ─► [ one kernel: per chunk, steps 1–6 in registers / LDS,
-                    state in registers, next inputs prefetched 2 chunks ahead ] ─► o, final state
+after:   q,k,v ─► [ one kernel: steps 1–6 on chip, state in registers, prefetch ] ─► o, final state
 ```
 
 ### rocprof: before and after
 
-**One layer at 32K tokens** (kernel trace):
-
 ![GDN kernel trace: Triton, staged FlyDSL, fused](images/mem_gdn_trace.png)
 
-Triton: 9 kernels, 3.0 ms; the state scan alone is 1.3 ms. The staged FlyDSL
-path (faster stages, but still 8 kernels that pass their results through HBM)
-gets to 2.5 ms. Fused: 1 kernel, 1.6 ms.
-
-**Data moved per layer, per kernel** (rocprof-compute block 17):
+Triton: 9 kernels, 3.0 ms (the state scan alone 1.3 ms). Staged FlyDSL (faster
+stages, still through HBM): 2.5 ms. Fused: 1 kernel, **1.6 ms**.
 
 ![GDN data moved per layer, per kernel](images/mem_gdn_traffic.png)
 
-Before: **14.3 GB** per layer, 11.0 GB read and 3.3 GB written, most of it
-intermediates. The state scan is the biggest part: 6.2 GB read and 1.2 GB
-written. After: **3.5 GB**. The fused kernel
-writes **0.4 GB, which is exactly the output o** (32K tokens × 48 heads × 128
-× 2 bytes = 0.40 GB): nothing else leaves the chip. It reads 3.1 GB, still
-above the 0.7 GB minimum, because q and k are read again by every workgroup
-that needs them (4 state slices per head, 3 value heads per key head); part
-of that is served by the caches.
+Traffic falls from **14.3 GB** to **3.5 GB** per layer. The fused kernel
+writes **0.4 GB, exactly the output o**: nothing else leaves the chip. Its
+3.1 GB of reads are above the 0.7 GB minimum because every workgroup that
+needs q and k reads them again.
 
-### Takeaway
-
-Count the bytes, not only the FLOPs. Split into stages, a chunked algorithm
-writes every intermediate to HBM and reads it back. When the stages share a
-serial loop anyway, as GDN's chunks do, run them in one kernel, keep the
-state and the intermediates on chip, and issue the next chunk's loads early.
-In rocprof-compute, multiply the L2-Fabric bandwidth by the kernel time and
-compare it with the inputs and outputs the math really needs: the writes in
-particular should be close to the size of the output.
-
-## Summary
-
-| Part | Kernel | Problem | How it shows in rocprof | Fix | Result |
-|---|---|---|---|---|---|
-| 1. Shape | QSA sparse decode | grid = rows × 2 KV heads, positions in a loop | 16 workgroups, CU Utilization 5.4% at batch 8 | split-KV: grid from the CU count | 46% CU utilization; 92 → 21 µs per call |
-| 2. MMA | HC site | 8 waves on one 16-row tile; weights through LDS | 57,600 MFMAs, 136,703 LDS instructions | one wave per tile; weights packed in fragment order | 13,120 MFMAs, no LDS in the down GEMV; 43.5 → 16.0 µs per site |
-| 3. Memory | GDN prefill | 9 kernels pass intermediates through HBM | 14.3 GB per layer, 3.3 GB written | one kernel; state and intermediates on chip; prefetch | 3.5 GB, 0.4 GB written (= the output); 3.0 → 1.6 ms per layer |
-
-The math of these kernels did not change. What changed was how the work is
-split across the GPU, how it reaches the matrix cores, and how much of it goes
-through HBM. That gave 1.9–4.4× at the kernel level in these measurements and
-up to +15% end-to-end interactivity.
-
-## Appendix: reproducing the screens
-
-Each driver calls the before and the after path of one PR at the shapes
-above:
-
-- **QSA** (from sglang#45196's `bench_qsa_sparse_decode.py`):
-  `qsa_driver.py --impl gather_triton|fused_flydsl --batch 8` (and
-  `--batch 1 2 4 16 32 64 128` for the batch chart)
-- **HC** (from sglang#48648's `test_hc_fused_flydsl.py`, 16 different layers in
-  turn so the weights are not cache-hot): `hc_driver.py --impl unfused|fused --rows 1`
-- **GDN** (from aiter#6496's `bench_gdn_fused_prefill.py`):
-  `gdn_driver.py --impl triton|flydsl|fused` (H 48, Hg 16, T 32768, N 1)
-
-**Kernel trace:**
-
-```bash
-rocprofv3 --kernel-trace -T -f csv pftrace -d prof/gdn_triton -o run -- \
-    python gdn_driver.py --impl triton
-```
-
-**Counters** (rocprof-compute needs `pip install -r
-/opt/rocm/libexec/rocprofiler-compute/requirements.txt`; with pandas 3,
-version 3.4.0 cannot parse the rocprofv3 output, so use `pandas<3`):
-
-```bash
-rocprof-compute profile -n qsa_before --no-roof -k _sparse_gqa_chunk_prefill \
-    --path workloads/qsa_before -- python qsa_driver.py --impl gather_triton --iters 5
-rocprof-compute analyze -p workloads/qsa_before -b 0            # kernel list, -k index
-rocprof-compute analyze -p workloads/qsa_before -k 0 -b 2 7     # shape
-
-# CU utilization only, one batch size per run (the batch chart):
-rocprof-compute profile -n cu_before_b16 --no-roof -b 2.1.33 7.1.0 -k _sparse_gqa_chunk_prefill \
-    --path workloads/cu_before_b16 -- python qsa_driver.py --impl gather_triton --batch 16
-
-rocprof-compute profile -n hc_after --no-roof -k _hc_down_fused _hc_reduce_fused _hc_up_fused \
-    _hc_inject_fused --path workloads/hc_after -- python hc_driver.py --impl fused --iters 16
-rocprof-compute analyze -p workloads/hc_after -k 0 -b 7 10 17   # MFMA, LDS, bandwidth
-
-rocprof-compute profile -n gdn_after --no-roof -k gdn_fused_prefill \
-    --path workloads/gdn_after -- python gdn_driver.py --impl fused --iters 2
-rocprof-compute analyze -p workloads/gdn_after -k 0 -b 17       # L2 and fabric
-```
-
-| Image | Source | Kernel(s) |
-|---|---|---|
-| `shape_qsa_counters.png` | rocprof-compute blocks 2, 7 | QSA attention kernel |
-| `shape_qsa_batch.png` | rocprof-compute 2.1.33 at 1, 2, 4 … 128 rows | QSA attention kernel |
-| `mma_hc_before.png` | rocprof-compute blocks 7, 10, 17 | HC Triton mix |
-| `mma_hc_after.png` | rocprof-compute blocks 7, 10, 17 | HC fused down and up GEMVs |
-| `mma_hc_trace.png` | kernel trace | one HC site |
-| `mem_gdn_trace.png` | kernel trace | one GDN layer, 3 paths |
-| `mem_gdn_traffic.png` | rocprof-compute block 17 | all GDN kernels |
+**Takeaway:** count bytes, not only FLOPs. When stages share a serial loop, as
+GDN's chunks do, fuse them, keep state and intermediates on chip, and load
+ahead. In rocprof-compute, L2-Fabric bandwidth × kernel time should be close to
+what the math needs; writes in particular should match the output size.
 
 ### Monokernel
 
