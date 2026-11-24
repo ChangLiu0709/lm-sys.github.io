@@ -44,16 +44,6 @@ The quantized checkpoint occupies approximately 116 GB, fitting comfortably on a
 
 ## Kernel Optimization
 
-# Porting NVIDIA kernels to MI355X: what you need to rewrite
-
-A kernel tuned for B300 usually *runs* on MI355X (gfx950). Triton compiles for
-ROCm, and CUDA code can be HIPified. But it rarely runs *well*. We saw this
-while bringing up Qwen3.8-Flash-Next in SGLang on MI355X. Three parts of the
-model needed new kernels, and in all three the math stayed the same. What we
-rewrote was how the work is split, how data reaches the matrix cores, and
-where the kernel boundaries are. That gave 1.4–5.7× at the kernel level and up
-to +15% end-to-end interactivity.
-
 ## Where the kernels sit in Qwen3.8-Flash-Next
 
 Qwen3.8-Flash-Next is a hybrid model with 48 layers:
@@ -76,13 +66,6 @@ These are the shapes the kernels see:
 | GDN chunked prefill | 48 value heads, 16 key heads, K = V = 128, 64-token chunks | 8 launches per layer, per-chunk state round trip through HBM |
 | HC site, decode | 4 streams × 2560 = K 10240, low rank R 320, M ≤ 128 rows | Norm, mix, inject GEMV and combine as separate small kernels |
 
-| Kernel | NVIDIA path in SGLang | Rewrite for MI355X | Kernel gain | End to end (MI355X, TP1) |
-|---|---|---|---|---|
-| QSA sparse decode ([sglang#45196](https://github.com/sgl-project/sglang/pull/45196), [aiter#6670](https://github.com/ROCm/aiter/pull/6670)) | Triton KV gather + FlashInfer TRT-LLM decode | One fused FlyDSL kernel with split-KV | 120 → 33 µs/call (3.4–5.7×) | +12.7% p50 interactivity, −11% ITL |
-| GDN chunked prefill ([sglang#44103](https://github.com/sgl-project/sglang/pull/44103), [aiter#6496](https://github.com/ROCm/aiter/pull/6496)) | FlashInfer CuTe DSL chunk kernel | One fused kernel, state kept on chip | 1.6× vs best multi-kernel path, 2.2× vs Triton | up to +3.6% throughput, −8.7% TTFT p95 |
-| HC site, decode ([sglang#48648](https://github.com/sgl-project/sglang/pull/48648)) | CuTe DSL split-K GEMM + separate norm/combine | Norm and inject fused into the mix | 3.0× at M=1, 1.4× at M=128 | +14.9% P90 interactivity, +5.6% throughput |
-
-The code below is taken from these PRs. Lines marked `...` are left out.
 
 ## 1. Kernel shape: QSA sparse decode did not fit the GPU
 
@@ -172,8 +155,6 @@ down GEMV  16 rows × 32  per tile = 2 MFMA tiles   → every wave computes both
 The down GEMV issues 51,200 MFMAs instead of 6,400. With the up GEMV, that is
 **57,600 MFMAs where 12,800 are needed**, exactly what rocprof-compute reports:
 
-![HC Triton mix kernel, batch 1, rocprof-compute](images/mma_hc_before.png)
-
 The matrix cores are not the bottleneck (MFMA utilization stays under 1%; a
 batch-1 GEMV is memory-bound). The copies cost waves: each one reads its tile
 back from LDS (most of the 136,703 LDS instructions), 95% of the 120 M
@@ -193,8 +174,6 @@ with 8 TB/s.
   down GEMV.
 
 ### Result
-
-![HC fused down and up GEMVs, batch 1, rocprof-compute](images/mma_hc_after.png)
 
 | per HC site, batch 1 | Before | After (down + up) |
 |---|---:|---:|
@@ -268,11 +247,6 @@ after:   q,k,v ─► [ one kernel: steps 1–6 on chip, state in registers, pre
 ```
 
 ### rocprof: before and after
-
-![GDN kernel trace: Triton, staged FlyDSL, fused](images/mem_gdn_trace.png)
-
-Triton: 9 kernels, 3.0 ms (the state scan alone 1.3 ms). Staged FlyDSL (faster
-stages, still through HBM): 2.5 ms. Fused: 1 kernel, **1.6 ms**.
 
 ![GDN data moved per layer, per kernel](images/mem_gdn_traffic.png)
 
