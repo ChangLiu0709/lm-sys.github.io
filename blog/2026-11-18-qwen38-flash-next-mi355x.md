@@ -134,7 +134,7 @@ cache pool instead of from a gathered copy.
 into the grid, and size waves and tiles for MFMA. Check **Grid Size** and
 **CU Utilization** at the batch sizes you actually serve, not only the largest.
 
-## 2. MMA: the HC mix issued 4.5× too many MFMAs ([sglang#48648](https://github.com/sgl-project/sglang/pull/48648))
+## 2. MMA: the HC mix issued 4.5× too many MFMAs
 
 The HC site mixes four residual streams (10,240 values per row) with two
 GEMVs: **down** to 320 values and **up** back to 10,240. At batch 1 that is
