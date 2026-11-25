@@ -26,7 +26,7 @@ At high concurrency (24–80), the workload is dominated by long, largely shared
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its inference, these properties of the model architecture matter:
+Just quick recap of the Qwen3.8-Flash-Next model architecture. For its inference, these properties of the model architecture matter:
 
 - **Gated Delta Net.** 36 of the 48 layers use Gated Delta Net, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context.
 - **Query Sparse Attention.** The other 12 use Query Sparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
@@ -38,7 +38,7 @@ The model architecture of Qwen3.8-Flash-Next is shown in Figure 2. For its infer
 
 ### The checkpoint: MXFP4 experts with AMD Quark
 
-For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next model weights using AMD Quark, a model optimization toolkit that supports post-training quantization for efficient inference on AMD hardware. The resulting quantized model reduces GPU memory consumption and improves inference efficiency. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`.
+For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next model weights using [AMD Quark](https://github.com/amd/quark), a model optimization toolkit that supports post-training quantization for efficient inference on AMD hardware. The resulting quantized model reduces GPU memory consumption and improves inference efficiency. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`.
 
 The quantized checkpoint occupies approximately 116 GB, fitting comfortably on a single AMD Instinct MI355X GPU (288 GB HBM3E) while leaving enough memory for a large KV cache, enabling higher concurrency and more efficient inference serving. The MTP draft model is quantized using the same approach as the target model, allowing its MoE layers to benefit from the same optimized MXFP4 kernels.
 
@@ -316,15 +316,17 @@ two copy kernels.)
 A GDN layer keeps a 128 × 128 state per value head. In prefill, tokens are cut
 into chunks of 64 (512 chunks at 32K), and for every chunk and head:
 
-```
-                                                                   kernel
-1. normalize q, k                                                  copy + l2norm
-2. A    = masked, decayed β·k·kᵀ                     64 × 64       kkᵀ
-3. T    = (I + A)⁻¹                                  64 × 64       inverse
-4. w, u = from T, k, v                               64 × 128      w, u
-5. S    = new state from the old S, w, u, k          128 × 128     state scan h  ◄── needs the previous chunk
-6. o    = output from q, k, S, u                     64 × 128      output o
-```
+$$
+\begin{array}{rlcl}
+ & \textbf{step} & \textbf{shape} & \textbf{kernel} \\[2pt]
+1. & q,\ k \leftarrow \operatorname{l2norm}(q),\ \operatorname{l2norm}(k) & & \text{copy + l2norm} \\
+2. & A = \text{masked, decayed } \beta\, k k^\top & 64 \times 64 & k k^\top \\
+3. & T = (I + A)^{-1} & 64 \times 64 & \text{inverse} \\
+4. & w,\ u = \text{from } T,\ k,\ v & 64 \times 128 & w,\ u \\
+5. & S_c = \text{new state from } S_{c-1},\ w,\ u,\ k & 128 \times 128 & \text{state scan } h \quad \longleftarrow \text{needs the previous chunk} \\
+6. & o = \text{output from } q,\ k,\ S_{c-1},\ u & 64 \times 128 & \text{output } o
+\end{array}
+$$
 
 Only the inputs and the output o must touch HBM: about 0.7 GB read and 0.4 GB
 written per layer at 32K tokens. The Triton path instead runs each step as
