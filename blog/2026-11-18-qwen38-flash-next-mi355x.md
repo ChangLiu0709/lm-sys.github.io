@@ -224,7 +224,7 @@ from 9.4% to 2.8% of decode GPU time. Interactivity p50 rises **+12.7%**
 (127.4 → 143.5 tok/s/user), ITL p50 falls **−11.2%** (7.85 → 6.97 ms), and
 throughput rises +3.3% (78,957 → 81,530 tok/s/GPU).
 
-## 2. MMA: the HC mix issued 4.5× too many MFMAs ([sglang#48648](https://github.com/sgl-project/sglang/pull/48648))
+## 2. MMA: the HC mix issued 4.5× too many MFMAs
 
 First we noticed that at decode the HC mix kernel, `_hc_mix_persistent_kernel`,
 took 32 of the 43.5 µs of an HC site at batch 1. Looking at its instruction
@@ -286,7 +286,7 @@ output tiles. Size the waves per product, and split `k` across workgroups when
 there is only one tile. In rocprof, an MFMA count that is a multiple of the
 needed one means the waves compute copies.
 
-**End to end** ([sglang#48648](https://github.com/sgl-project/sglang/pull/48648):
+**End to end** (
 InferenceX AgentX, MI355X TP1, concurrency 24, 1 hour, against the average of
 two runs of main): P90 interactivity rises **+14.9%** (53.9 → 62.0
 tok/s/user), throughput **+5.6%** (108,512 → 114,575 tok/s/GPU), and ITL p90
@@ -390,7 +390,7 @@ At concurrency 12 throughput rises **+3.6%** and TTFT p95 falls −4.9%; at
 concurrency 24 TTFT p95 falls **−8.7%** and throughput rises +0.9%. ITL p95
 falls 2.6–4.6% at concurrency 12–24.
 
-## 4. Dispatch: a dtype check switched off the fused QSA indexer ([sglang#41282](https://github.com/sgl-project/sglang/pull/41282))
+## 4. Dispatch: a dtype check switched off the fused QSA indexer
 
 First we noticed that at decode every QSA layer launched dozens of tiny PyTorch
 kernels before the indexer's top-k: elementwise ops, gathers, RoPE, cats and
@@ -459,7 +459,7 @@ kernels on one platform than on another, look for a fallback. In the kernel
 trace, count the kernels per layer, and watch for runs of tiny kernels on one
 or two workgroups.
 
-**End to end** ([sglang#41282](https://github.com/sgl-project/sglang/pull/41282):
+**End to end** (
 InferenceX AgentX, MI355X TP1, concurrency 8, 1 hour): interactivity p50 rises
 **+28%** (91.2 → 117.1 tok/s) and p90 **+75%** (45.3 → 79.4 tok/s), ITL p50
 falls **−23%** (11.0 → 8.5 ms), TTFT p50 falls −28% (1,020 → 739 ms), and
