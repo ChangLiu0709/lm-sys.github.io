@@ -69,15 +69,33 @@ These are the shapes the kernels see:
 
 ## 1. Kernel shape: QSA sparse decode did not fit the GPU
 
-MI355X has **256 CUs**, and a kernel is fast only if every CU has work. At
-decode, each row is one query token: 24 query heads (12 per KV head, GQA)
+First we noticed that SGLang used `_sparse_gqa_chunk_prefill`, a Triton
+*prefill* kernel, for QSA decode, and that GPU utilization during decode was
+low. Looking at the kernel's shape, we found that it filled only a small part
+of the CUs.
+
+MI355X has **256 CUs**, each with room for 32 waves. The kernel launches one
+workgroup of 8 waves per decode row and KV head, so each request gets only
+2 workgroups. At decode, concurrency is the number of rows:
+
+| Concurrency | Workgroups | CUs with work | Waves launched (of 8,192 slots) | CU Utilization | Kernel time |
+|---|---:|---:|---:|---:|---:|
+| 8 | 16 | **16 of 256** (6%) | 128 | **5.4%** | 69.5 µs |
+| 16 | 32 | **32 of 256** (13%) | 256 | **10.8%** | 69.7 µs |
+
+At concurrency 8, 240 of the 256 CUs are idle for the whole 70 µs; at
+concurrency 16, 224 are. The CUs that do have work hold one workgroup each,
+8 of their 32 wave slots. Doubling the concurrency doubles the CUs in use but
+does not change the kernel time, because each workgroup still walks all of
+its positions alone.
+
+### Why: a prefill kernel reused for decode
+
+At decode, each row is one query token: 24 query heads (12 per KV head, GQA)
 attend to 2,051 selected positions of their KV head. So the kernel has three
 dimensions: **rows** (1–128), **KV heads** (2) and **positions** (2,051).
-
-### Before: a prefill kernel reused for decode
-
-ROCm ran the Triton *prefill* kernel `_sparse_gqa_chunk_prefill` with a query
-length of 1. At batch 8:
+`_sparse_gqa_chunk_prefill` runs here with a query length of 1 and puts only
+the first two in the grid. At batch 8:
 
 | Level | Before (Triton) |
 |---|---|
@@ -88,19 +106,21 @@ length of 1. At batch 8:
 
 Three problems:
 
-1. **The grid follows the problem, not the GPU.** 16 of 256 CUs work at
-   batch 8, and 2 at batch 1. Only 2 KV heads makes it worse.
-2. **The only large dimension is a loop.** Each workgroup walks all 2,051
-   positions, so the kernel takes 65 steps whatever the batch.
-3. **The tile was sized for another GPU.** A 16-row tile is one MFMA tile, so
-   the 8 waves cannot split it: all of them compute the same scores (the same
-   mistake as in part 2).
+1. **The grid follows the problem, not the GPU.** 2 KV heads gives
+   2 workgroups at batch 1, so the kernel fills all 256 CUs only at batch 128.
+2. **The large dimension is a loop.** Each workgroup walks all 2,051
+   positions.
+3. **The same calculations run many times.** A 16-row tile is one MFMA tile,
+   so the 8 waves of a workgroup cannot split it: **all 8 compute the same
+   scores**. Per 32 positions the workgroup issues 144 MFMAs where 32 are
+   needed, 4.5× too many (the same mistake as in part 2).
 
-### After: split-KV, grid computed from the CU count
+### Fix: split-KV, grid computed from the CU count
 
-The FlyDSL kernel cuts each row's positions into `num_splits` pieces, one
-workgroup each. Each workgroup writes a partial result (`O`, max `m`, sum
-`l`), and a small reduce kernel merges them as online softmax does.
+The FlyDSL kernel cuts each row's positions into `num_splits` pieces
+(computed from the number of CUs), one workgroup each. Each workgroup writes a
+partial result (`O`, max `m`, sum `l`), and a small reduce kernel merges them
+as online softmax does.
 
 | Level | After (FlyDSL), batch 8 |
 |---|---|
@@ -109,15 +129,7 @@ workgroup each. Each workgroup writes a partial result (`O`, max `m`, sum
 | Tile | per wave **16 tokens × 16 heads**, one 16 × 16 × 32 MFMA tile |
 | Loop | 192 positions per split = **3 rounds** of 4 waves × 16 tokens |
 
-Tokens now sit on the 16-row side of the tile, so each wave has its own work.
-`num_splits` is chosen at run time: aim for one workgroup per CU, keep at
-least 128 positions per split (below that, workgroup startup dominates), and
-round to whole 64-position rounds. It depends only on the batch size, so it is
-fixed per captured CUDA graph.
-
-
-At batch 8: 16 workgroups, 128 wavefronts and **5.4% CU Utilization** before;
-176 workgroups, 704 wavefronts and **46.6%** after.
+![QSA decode work split at batch 8, before and after split-KV](images/shape_qsa_split_kv.svg)
 
 ![QSA attention kernel CU utilization vs batch](images/shape_qsa_batch.png)
 
@@ -126,13 +138,38 @@ only at batch 128. After, it is 46% at batch 8 and over 70% from batch 32. At
 batch 1 it stays at 8%: the 128-position minimum caps the grid at 34
 workgroups.
 
-At batch 128 nothing is split and the reduce is skipped, but the new kernel is
-still 1.4× faster: no duplicated waves, and it reads K/V straight from the
-cache pool instead of from a gathered copy.
+### rocprof: before and after
+
+![QSA decode kernel trace at batch 16, before and after](images/shape_qsa_trace.png)
+
+Split-KV adds a kernel: the reduce that merges the partial results. It costs
+only 3.5 µs. The attention kernel alone drops from 69.1 to 22.3 µs, so
+attention plus reduce (25.9 µs) is still **2.7× faster than the old attention
+kernel by itself**. The whole call drops from 4 kernels and 103 µs to 2 kernels
+and 26 µs (**4.0×**).
+
+The other three old kernels are gone because the new kernel does their work
+itself. `_sparse_gqa_chunk_prefill` is a varlen prefill kernel: it expects the
+keys and values of each row packed back to back in one buffer, with an offset
+per row. Three kernels built that buffer:
+
+- **Metadata helpers** (`_fa2_valid_counts`, `_fa2_prefix_sum`, 9 µs) count
+  the valid selected positions of each row (0 ≤ position < sequence length) and
+  turn the counts into row offsets in the packed buffer.
+- **KV gather** (`_compact_kv`, 24.8 µs) looks up the KV cache slot of each
+  selected position in `req_to_token` and copies those K/V rows into the packed
+  buffer: at batch 16, 67 MB written to HBM only for the attention kernel to
+  read it back.
+
+The FlyDSL kernel reads the top-k positions of its row directly, skips the
+invalid ones, looks up each slot in `req_to_token` and loads K/V straight from
+the cache pool. It needs no counts, no offsets and no copy.
+
 
 **Takeaway:** compute the grid from the CU count, move part of the long loop
 into the grid, and size waves and tiles for MFMA. Check **Grid Size** and
 **CU Utilization** at the batch sizes you actually serve, not only the largest.
+
 
 ## 2. MMA: the HC mix issued 4.5× too many MFMAs
 
