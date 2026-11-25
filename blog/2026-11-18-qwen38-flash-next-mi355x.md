@@ -390,6 +390,81 @@ At concurrency 12 throughput rises **+3.6%** and TTFT p95 falls −4.9%; at
 concurrency 24 TTFT p95 falls **−8.7%** and throughput rises +0.9%. ITL p95
 falls 2.6–4.6% at concurrency 12–24.
 
+## 4. Dispatch: a dtype check switched off the fused QSA indexer ([sglang#41282](https://github.com/sgl-project/sglang/pull/41282))
+
+First we noticed that at decode every QSA layer launched dozens of tiny PyTorch
+kernels before the indexer's top-k: elementwise ops, gathers, RoPE, cats and
+index stores. SGLang has two fused kernels for this step, and on CUDA they run.
+We found that on ROCm they never did.
+
+At batch 8, one QSA layer's indexer prep ran **44 kernels and 125 µs** of GPU
+time, and 38 of those kernels ran on only 1 or 2 workgroups.
+
+### Why: the fused path needs an fp32 RoPE cache
+
+Before the indexer scores the compressed keys, it prepares its inputs for every
+decode row:
+
+- **q prep:** RMSNorm and MRoPE on the index query, and a store of the token's
+  key and RoPE positions into a ring of 4 pending tokens;
+- **k compress:** once the ring holds 4 tokens, their mean, RMSNorm and MRoPE,
+  stored into the compressed key cache.
+
+The fused kernels read the RoPE cos/sin table as `const float*`, so
+`_use_fused_prep()` allows them only when `cos_sin_cache` is fp32. On CUDA it
+is. On HIP, three code paths of the rotary embedding converted it to bf16:
+
+1. **The init guard** kept fp32 only on CUDA and XPU, so on HIP the cache was
+   created in bf16.
+2. **`_match_cos_sin_cache_dtype`** (in `base.py` and `mrope.py`) converted it
+   to the query dtype on the first forward.
+3. **`fallback_rotary_embedding`** converted it to the query dtype as well.
+
+So the check returned False, and the indexer fell back to its eager PyTorch
+path. The results stayed correct, so nothing failed and nothing was logged:
+only the kernel trace shows it.
+
+### Fix: keep the cache fp32 on HIP
+
+The PR does on HIP what CUDA already did: the init guard keeps fp32, and the
+two later conversions only move the cache to the right device, without changing
+its dtype. The cache is a read-only table of 256K positions × 64 values, so fp32
+costs about 64 MB.
+
+![QSA indexer prep, before and after the fix](images/dispatch_qsa_indexer.svg)
+
+### rocprof: before and after
+
+![QSA indexer prep kernel trace at batch 8, before and after](images/dispatch_qsa_indexer_trace.png)
+
+One layer's indexer prep drops from 45 kernels and 131 µs to 3 kernels and
+16.6 µs (**7.9×**). The q/k projection GEMM (5.8 µs) is the same in both; the
+44 eager kernels (125 µs) become 2 fused ones (10.7 µs):
+
+- **q prep** (`qsa_index_q_prep_kernel`, 5.8 µs) replaces the eager q path:
+  RMSNorm, the cos/sin lookup, RoPE, a cat of the rotated and unrotated halves,
+  and the index stores into the ring.
+- **k compress** (`qsa_index_k_compress_kernel`, 4.9 µs) replaces the eager
+  compress path: a gather of each group's 4 keys, their mean, RMSNorm, the same
+  RoPE chain, and the store into the compressed cache.
+
+None of the eager kernels does much work: most take 2–5 µs on 1 or 2
+workgroups, which is mostly launch and ramp-up. With 12 QSA layers, that is
+about 1.4 ms of GPU time per decode step at batch 8 (12 × 115 µs). The PR
+measured about 2.3 ms per decode step in the server, roughly 20% of it.
+
+**Takeaway:** a fast path behind a runtime check can switch itself off without
+an error: the output stays correct, only slower. If a layer launches many more
+kernels on one platform than on another, look for a fallback. In the kernel
+trace, count the kernels per layer, and watch for runs of tiny kernels on one
+or two workgroups.
+
+**End to end** ([sglang#41282](https://github.com/sgl-project/sglang/pull/41282):
+InferenceX AgentX, MI355X TP1, concurrency 8, 1 hour): interactivity p50 rises
+**+28%** (91.2 → 117.1 tok/s) and p90 **+75%** (45.3 → 79.4 tok/s), ITL p50
+falls **−23%** (11.0 → 8.5 ms), TTFT p50 falls −28% (1,020 → 739 ms), and
+throughput rises +8.5% (31,611 → 34,291 tok/s/GPU).
+
 ### Monokernel
 
 When we first benchmarked this model on AMD MI355X we quickly realized that the low concurrency region (i.e., <= 8) was going to be the most critical for us in terms of performance.
