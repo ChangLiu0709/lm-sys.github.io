@@ -269,8 +269,6 @@ computes its own tile over its own k slice, and a small reduce kernel sums the
 32 partials. The up GEMV gets its own kernel too: 640 waves, one 16-column
 tile each.
 
-![HC down GEMV, before and after](images/mma_hc_waves.svg)
-
 ### rocprof: before and after
 
 ![HC MFMA count before and after (rocprof-compute)](images/mma_hc_mfma.png)
@@ -373,19 +371,12 @@ The fused kernel takes only 0.26 ms more than the old state scan by itself
   state stays in registers, and o is computed from the state the workgroup
   already holds.
 
-![GDN data moved per layer, per kernel](images/mem_gdn_traffic.png)
-
-Traffic falls from **14.3 GB** to **3.5 GB** per layer. The fused kernel
-writes **0.4 GB, exactly the output o**: nothing else leaves the chip. Its
-3.1 GB of reads are above the 0.7 GB minimum because every workgroup that
-needs q and k reads them again.
-
 **Takeaway:** count bytes, not only FLOPs. When stages share a serial loop, as
 GDN's chunks do, fuse them, keep state and intermediates on chip, and load
 ahead. In rocprof-compute, L2-Fabric bandwidth × kernel time should be close to
 what the math needs; writes in particular should match the output size.
 
-**End to end** ([sglang#44103](https://github.com/sgl-project/sglang/pull/44103):
+**End to end** (:
 InferenceX AgentX, MI355X TP1, 1 hour per point): measured against the staged
 FlyDSL path, which already takes 2.5 ms per layer instead of Triton's 3.0 ms.
 At concurrency 12 throughput rises **+3.6%** and TTFT p95 falls −4.9%; at
