@@ -350,7 +350,7 @@ only the kernel trace shows it.
 
 ### Fix: keep the cache fp32 on HIP
 
-The PR does on HIP what CUDA already did: the init guard keeps fp32, and the
+The PR does the init guard keeps fp32, and the
 two later conversions only move the cache to the right device, without changing
 its dtype. The cache is a read-only table of 256K positions × 64 values, so fp32
 costs about 64 MB.
