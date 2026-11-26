@@ -44,76 +44,7 @@ The quantized checkpoint occupies approximately 116 GB, fitting comfortably on a
 
 ## Kernel Optimization
 
-## Where the kernels sit in Qwen3.8-Flash-Next
-
-Qwen3.8-Flash-Next is a hybrid model with 48 layers:
-
-- **36 GDN layers** (Gated DeltaNet linear attention) keep a fixed-size state
-  instead of a KV cache. Prefill runs a chunked scan over 64-token chunks.
-- **12 QSA layers** (Qwen sparse attention, every fourth layer). An indexer
-  picks 512 compressed blocks of 4 tokens plus up to 3 recent tokens, so
-  each query attends to only 2,051 positions.
-- **Hyper-connections (HC).** The model keeps four residual streams. Around
-  every attention and MLP block, an HC site mixes the streams into the block
-  input and injects the block output back.
-
-All numbers below are for one MI355X at TP1, with the MXFP4 checkpoint and MTP.
-These are the shapes the kernels see:
-
-| Kernel | Shapes at TP1 | What limited it on MI355X |
-|---|---|---|
-| QSA sparse decode | 24 query heads, 2 KV heads (GQA group 12), head dim 256, top-k 2051 | Grid of rows × 2 KV heads, plus an extra gather pass |
-| GDN chunked prefill | 48 value heads, 16 key heads, K = V = 128, 64-token chunks | 8 launches per layer, per-chunk state round trip through HBM |
-| HC site, decode | 4 streams × 2560 = K 10240, low rank R 320, M ≤ 128 rows | Norm, mix, inject GEMV and combine as separate small kernels |
-
-
-## 1. Kernel shape: QSA sparse decode did not fit the GPU
-
-First we noticed that SGLang used `_sparse_gqa_chunk_prefill`, a Triton
-*prefill* kernel, for QSA decode, and that GPU utilization during decode was
-low. Looking at the kernel's shape, we found that it filled only a small part
-of the CUs.
-
-MI355X has **256 CUs**, each with room for 32 waves. The kernel launches one
-workgroup of 8 waves per decode row and KV head, so each request gets only
-2 workgroups. At decode, concurrency is the number of rows:
-
-| Concurrency | Workgroups | CUs with work | Waves launched (of 8,192 slots) | CU Utilization | Kernel time |
-|---|---:|---:|---:|---:|---:|
-| 8 | 16 | **16 of 256** (6%) | 128 | **5.4%** | 69.5 µs |
-| 16 | 32 | **32 of 256** (13%) | 256 | **10.8%** | 69.7 µs |
-
-At concurrency 8, 240 of the 256 CUs are idle for the whole 70 µs; at
-concurrency 16, 224 are. The CUs that do have work hold one workgroup each,
-8 of their 32 wave slots. Doubling the concurrency doubles the CUs in use but
-does not change the kernel time, because each workgroup still walks all of
-its positions alone.
-
-### Why: a prefill kernel reused for decode
-
-At decode, each row is one query token: 24 query heads (12 per KV head, GQA)
-attend to 2,051 selected positions of their KV head. So the kernel has three
-dimensions: **rows** (1–128), **KV heads** (2) and **positions** (2,051).
-`_sparse_gqa_chunk_prefill` runs here with a query length of 1 and puts only
-the first two in the grid. At batch 8:
-
-| Level | Before (Triton) |
-|---|---|
-| Grid | rows × KV heads = **16 workgroups** |
-| Workgroup | **8 waves** |
-| Tile | **16 rows × 32 tokens** (12 GQA heads padded to 16) |
-| Loop | **65 steps** of 32 positions per workgroup |
-
-Three problems:
-
-1. **The grid follows the problem, not the GPU.** 2 KV heads gives
-   2 workgroups at batch 1, so the kernel fills all 256 CUs only at batch 128.
-2. **The large dimension is a loop.** Each workgroup walks all 2,051
-   positions.
-3. **The same calculations run many times.** A 16-row tile is one MFMA tile,
-   so the 8 waves of a workgroup cannot split it: **all 8 compute the same
-   scores**. Per 32 positions the workgroup issues 144 MFMAs where 32 are
-   needed, 4.5× too many (the same mistake as in part 2).
+We captured perfetto traces, found the hotsposts kernes,  analyze them and discover some problems, let's we tell about few more interesting cases.
 
 ## 1. Kernel shape: QSA sparse decode did not fit the GPU
 
