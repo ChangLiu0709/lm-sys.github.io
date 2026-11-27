@@ -26,19 +26,19 @@ At high concurrency (24–80), the workload is dominated by long, largely shared
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-Just quick recap of the Qwen3.8-Flash-Next model architecture. For its inference, these properties of the model architecture matter:
+![Qwen3.8-Flash-Next Model Architecture](/images/blog/qwen38-flash-next-mi355x/architecture.png)
+*Figure 2: Qwen3.8-Flash-Next model architecture*
+
+Figure 2 shows the model main building blocks, these are:
 
 - **Gated Delta Net.** 36 of the 48 layers use Gated Delta Net, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context.
 - **Query Sparse Attention.** The other 12 use Query Sparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
 
-![Qwen3.8-Flash-Next Model Architecture](/images/blog/qwen38-flash-next-mi355x/architecture.png)
-*Figure 2: Qwen3.8-Flash-Next model architecture*
-
 ### The checkpoint: MXFP4 experts with AMD Quark
 
-For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next model weights using [AMD Quark](https://github.com/amd/quark), a model optimization toolkit that supports post-training quantization for efficient inference on AMD hardware. The resulting quantized model reduces GPU memory consumption and improves inference efficiency. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`.
+For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next model weights using [AMD Quark](https://github.com/amd/quark), a model optimization toolkit that supports post-training quantization for efficient inference on AMD hardware. The resulting quantized model reduces GPU memory consumption and improves inference efficiency. In our experiments, we serve [amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8).
 
 The quantized checkpoint occupies approximately 116 GB, fitting comfortably on a single AMD Instinct MI355X GPU (288 GB HBM3E) while leaving enough memory for a large KV cache, enabling higher concurrency and more efficient inference serving. The MTP draft model is quantized using the same approach as the target model, allowing its MoE layers to benefit from the same optimized MXFP4 kernels.
 
