@@ -389,15 +389,18 @@ InferenceX AgentX, MI355X TP1, concurrency 8, 1 hour): interactivity p50 rises
 falls **−23%** (11.0 → 8.5 ms), TTFT p50 falls −28% (1,020 → 739 ms), and
 throughput rises +8.5% (31,611 → 34,291 tok/s/GPU).
 
-### Monokernel
+## Improving interactivity at low concurrency with monokernels
 
-When we first benchmarked this model on AMD MI355X we quickly realized that the low concurrency region (i.e., <= 8) was going to be the most critical for us in terms of performance.
+When we first benchmarked this model we quickly realized that optimizing the low concurrency region (i.e., <= 8) was going to be a challenge.
+To understand why let's take a look at some traces:
 
 ![Traces before monokernel](/images/blog/qwen38-flash-next-mi355x/before_mono.png)
 *Figure 3: Kernel trace of a full decode step at concurrency 1 without monokernel*
 
-Figure 3 shows the full trace of one decode step at concurrency 1. As you can see, it takes roughly 14ms for a total of over **1600 individual kernel launches**.
-Launching a lot of kernels is not necessarily a problem as HIP graphs can get rid of kernel launch overheads but in this case it actually is. The issues is that these kernels are all very small so the GPU is not doing useful work but mostly loading data from and to HBM memory. In this scenario, the most practical optimization strategy is simply trying to reduce as much as possible the HBM traffic, this means fusing multiple operations together.
+Figure 3 shows the full trace of a single decode step at concurrency 1. As you can see, it takes roughly 14ms and over **1600 individual kernel launches**.
+Now, launching a lot of kernels is not necessarily a problem as HIP graphs can get rid of kernel launch overheads but in this case it actually is. The issue is that these kernels are all very small so the GPU is not doing useful work but rather spending most if the time moving data from and to HBM memory.
+
+In this scenario, the most practical optimization strategy is simply trying to reduce the HBM traffic as much as possible, this means fusing multiple operations together.
 
 In order to achieve the best possible performance at low concurrency, we decided to fuse as many kernels as possible into a single (mono) kernel.
 As we saw in figure 2, the basic building block for Qwen3.8-Flash-Next is 3x GDN layers followed by a QSA layer, repeated 12 times for a total of 48 hidden layers. We implemented a specialized FlyDSL kernel that replaces this basic building block with a **single kernel launch**.
@@ -405,7 +408,7 @@ As we saw in figure 2, the basic building block for Qwen3.8-Flash-Next is 3x GDN
 ![Traces with monokernel](/images/blog/qwen38-flash-next-mi355x/after_mono.png)
 *Figure 4: Kernel trace of a full decode step at concurrency 1 with the new FlyDSL monokernel*
 
-Figure 4 shows a full decode step with the monokernel on. With this we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
+Figure 4 shows a full decode step with the monokernel on. With this, we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
 
 For more details, the monokernel source code is available on [GitHub](https://github.com/sgl-project/sgl-amd-mono/tree/main/sgl_amd_mono/qwen38_flash_next).
 
