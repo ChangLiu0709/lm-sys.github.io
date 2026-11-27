@@ -16,7 +16,7 @@ We use InferenceX AgentX to evaluate inference performance, as InferenceX is a p
 
 As shown in Figure 1., we ran Qwen3.8-Flash-Next on one MI355X at concurrency 1, 2, 12, 24, 48 and 80 on the SGLang ROCm image lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261117. Each point replays recorded coding-agent sessions from the InferenceX AgentX trace set for 3,600 s. Total throughput per GPU rises from 16.8k to 230.8k tok/s as concurrency grows, while per-user interactivity ranges from ~390 to ~27 tok/s/user. At low concurrency the monokernel drives interactivity; at high concurrency kernel fusion and HiCache keep throughput scaling.
 
-![InferenceX AgentX: token throughput per chip vs. P90 interactivity](/images/blog/qwen38-flash-next-mi355x/agentx_performance.jpg)
+![InferenceX AgentX: token throughput per chip vs. P90 interactivity](/images/blog/qwen38-flash-next-mi355x/agentx_performance_v2.jpg)
 
 <p style="text-align: center;"><em>Figure 1. Screenshot of InferenceX AgentX Qwen3.8-Flash-Next performance: total throughput per GPU against interactivity across concurrency 1–80, comparing NVIDIA B200, NVIDIA B300, and AMD MI355X.</em></p>
 
