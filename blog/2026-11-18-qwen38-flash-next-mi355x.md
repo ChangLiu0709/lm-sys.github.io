@@ -44,7 +44,7 @@ The quantized checkpoint occupies approximately 116 GB, fitting comfortably on a
 
 ## Kernel Optimization
 
-We captured perfetto traces, found the hotsposts kernes,  analyze them and discover some problems, let's we tell about few more interesting cases.
+To find where decode and prefill time went on MI355X, we captured Perfetto traces with `rocprofv3`, ranked the kernels by GPU time, and profiled the hottest ones with `rocprof-compute`. The math in these kernels was correct; what made them slow fell into four categories: a kernel shape that left most CUs idle, matrix-core (MFMA) work issued several times over, intermediate results passed between kernels through HBM, and a fused kernel that was silently skipped on ROCm. The following sections walk through one representative case of each, showing the problem, the fix, and how both look in rocprof.
 
 ## 1. Kernel shape: QSA sparse decode did not fit the GPU
 
