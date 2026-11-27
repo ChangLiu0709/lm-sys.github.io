@@ -6,7 +6,7 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-Qwen3.8-Flash-Next is an efficient, open-weight MoE model, previewing the next-generation Qwen4 architecture. It has gained significant attention in the open-source community due to its strong coding and agentic capabilities, ultra-sparse architecture, and innovations such as Gated DeltaNet (GDN) and Qwen Sparse Attention (QSA) for efficient long-context inference. Given these strengths, enabling and optimizing Qwen3.8-Flash-Next inference on AMD Instinct™ GPUs is important. In this blog, we demonstrate how to optimize its inference performance in SGLang on AMD GPUs. We benchmark inference performance using InferenceX AgentX, which replays realistic multi-turn agentic coding workloads and measures throughput and interactivity across different concurrency levels. Our optimized AMD MI355X implementation outperforms NVIDIA B200 and B300 GPUs across all tested concurrency levels.
+Qwen3.8-Flash-Next is an efficient, open-weight MoE model, previewing the next-generation Qwen4 architecture. It has gained significant attention in the open-source community due to its strong coding and agentic capabilities, ultra-sparse architecture, and innovations such as Gated DeltaNet (GDN) and Qwen Sparse Attention (QSA) for efficient long-context inference. Given these strengths, enabling and optimizing Qwen3.8-Flash-Next inference on AMD Instinct™ GPUs is important. In this blog, we demonstrate how to optimize its inference performance in SGLang on AMD GPUs. We benchmark inference performance using InferenceX AgentX, which replays realistic multi-turn agentic coding workloads and measures throughput and interactivity across different concurrency levels. Our optimized implementation delivers strong inference performance on AMD Instinct MI355X GPUs across all tested concurrency levels.
 
 This post explores how we serve and optimize Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs using SGLang. We begin with our latest InferenceX AgentX benchmark results, followed by a brief introduction of the model architecture, key kernel optimizations for MI355X, including grid sizing for 256 CUs, kernel fusion, MFMA-native layouts, register prefetching, and wave64, and the monokernel for low concurrency. All results can be reproduced using the commands provided in the [SGLang cookbook](https://lmsysorg.mintlify.app/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next#hw=mi355x&variant=default&quant=fp8&strategy=balanced&nodes=single&pleOffload=auto).
 
@@ -18,16 +18,17 @@ As shown in Figure 1., we ran Qwen3.8-Flash-Next on one MI355X at concurrency 1,
 
 ![InferenceX AgentX: token throughput per chip vs. P90 interactivity](/images/blog/qwen38-flash-next-mi355x/agentx_performance.jpg)
 
-*Figure 1. Screenshot of InferenceX AgentX Qwen3.8-Flash-Next performance: total throughput per GPU against interactivity across concurrency 1–80, comparing NVIDIA B200, NVIDIA B300, and AMD MI355X.*
+<p style="text-align: center;"><em>Figure 1. Screenshot of InferenceX AgentX Qwen3.8-Flash-Next performance: total throughput per GPU against interactivity across concurrency 1–80, comparing NVIDIA B200, NVIDIA B300, and AMD MI355X.</em></p>
 
 At high concurrency (24–80), the workload is dominated by long, largely shared prompts, so prefill speed and cache capacity matter as much as decode speed. Our MI355X run reaches about 126k tokens/s per chip at conc=24 and about 231k at conc=80, matching or exceeding B300 at the same P90 interactivity and staying well above B200 and our previous MI355X results. At low concurrency (1–2), decoding is bound by kernel launches, not arithmetic: one decode step took about 14 ms across more than 1,600 small kernels. Our monokernel, a persistent FlyDSL kernel that runs a full MTP verify step in 13 launches, cuts that to about 4 ms. P90 interactivity reaches about 390 tokens/s/user at one agent, where B300's curve falls off to a few thousand tokens/s per chip. We will give more details about the optimizations in the latter sections.
 
-**NOTE:** Until the day Nov 19, 2026, we wrote the blog and the performance submission shown in the figure depended on 7 PRs that awaited to be merged to the SGLang main branch.
+**NOTE:** As of November 19, 2026, when we drafted the blog, the performance submission shown in the figure depended on seven PRs that were still awaiting merge into SGLang's main branch.
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-![Qwen3.8-Flash-Next Model Architecture](/images/blog/qwen38-flash-next-mi355x/architecture.png)
-*Figure 2: Qwen3.8-Flash-Next model architecture*
+<img src="/images/blog/qwen38-flash-next-mi355x/architecture.png" alt="Qwen3.8-Flash-Next Model Architecture" style="display:block; margin-left: auto; margin-right: auto; width: 80%;"></img>
+
+<p style="text-align: center;"><em>Figure 2: Qwen3.8-Flash-Next model architecture</em></p>
 
 Figure 2 shows the model main building blocks, these are:
 
@@ -110,9 +111,9 @@ reduce kernel merges the partials the same way online softmax does.
 | Tile | per wave **16 tokens × 16 heads**, one 16 × 16 × 32 MFMA tile |
 | Loop | 192 positions per split = **3 rounds** of 4 waves × 16 tokens |
 
-![QSA decode work split at batch 8, before and after split-KV](images/shape_qsa_split_kv.svg)
+![QSA decode work split at batch 8, before and after split-KV](/images/blog/qwen38-flash-next-mi355x/shape_qsa_split_kv.svg)
 
-![QSA attention kernel CU utilization vs batch](images/shape_qsa_batch.png)
+![QSA attention kernel CU utilization vs batch](/images/blog/qwen38-flash-next-mi355x/shape_qsa_batch.png)
 
 With split-KV, CU utilization no longer tracks the batch size alone. Before
 the change, it follows the workgroup count and reaches the full GPU only at
@@ -120,7 +121,7 @@ batch 128; after it, utilization is 46% at batch 8 and above 70% from batch 32
 onward. At batch 1 it stays at 8%, because the 128-position minimum per split
 caps the grid at 34 workgroups.
 
-![QSA decode kernel trace at batch 16, before and after](images/shape_qsa_trace.png)
+![QSA decode kernel trace at batch 16, before and after](/images/blog/qwen38-flash-next-mi355x/shape_qsa_trace.png)
 
 The kernel trace at batch 16 shows the cost of the extra reduce kernel: only
 3.5 µs. The attention kernel itself drops from 69.1 to 22.3 µs, so attention
@@ -202,9 +203,9 @@ computes its own tile over its own slice of k, and a small reduce kernel sums
 the 32 partial results. The up GEMV also gets its own kernel: 640 waves, each
 owning one 16-column tile.
 
-![HC down GEMV, before and after](images/mma_hc_waves.svg)
+![HC down GEMV, before and after](/images/blog/qwen38-flash-next-mi355x/mma_hc_waves.svg)
 
-![HC MFMA count before and after (rocprof-compute)](images/mma_hc_mfma.png)
+![HC MFMA count before and after (rocprof-compute)](/images/blog/qwen38-flash-next-mi355x/mma_hc_mfma.png)
 
 rocprof-compute confirms that the copies are gone. The down GEMV now issues
 6,720 MFMAs: the 6,400 it needs plus 320 for the inject GEMV, which moved into
@@ -282,9 +283,9 @@ The fused FlyDSL kernel does the work of all 9 kernels for a chunk within one
 workgroup and walks through the chunks in order, so the state and the
 intermediates stay on chip and only o leaves it.
 
-![GDN data flow per layer, before and after](images/mem_gdn_flow.svg)
+![GDN data flow per layer, before and after](/images/blog/qwen38-flash-next-mi355x/mem_gdn_flow.svg)
 
-![GDN kernel trace, one layer at 32K tokens, before and after](images/mem_gdn_trace.png)
+![GDN kernel trace, one layer at 32K tokens, before and after](/images/blog/qwen38-flash-next-mi355x/mem_gdn_trace.png)
 
 In the trace, one layer drops from 9 kernels and 3.0 ms to a single kernel and
 1.6 ms (**1.9×**). The fused kernel takes only 0.26 ms longer than the old
@@ -354,9 +355,9 @@ and the two later conversions only move the cache to the right device without
 changing its dtype. The cache is a read-only table of 256K positions ×
 64 values, so keeping it in fp32 costs only about 64 MB.
 
-![QSA indexer prep, before and after the fix](images/dispatch_qsa_indexer.svg)
+![QSA indexer prep, before and after the fix](/images/blog/qwen38-flash-next-mi355x/dispatch_qsa_indexer.svg)
 
-![QSA indexer prep kernel trace at batch 8, before and after](images/dispatch_qsa_indexer_trace.png)
+![QSA indexer prep kernel trace at batch 8, before and after](/images/blog/qwen38-flash-next-mi355x/dispatch_qsa_indexer_trace.png)
 
 With the fused path back, the indexer prep of one layer drops from 45 kernels
 and 131 µs to 3 kernels and 16.6 µs (**7.9×**). The q/k projection GEMM
@@ -393,7 +394,8 @@ When we first benchmarked this model we quickly realized that optimizing the low
 To understand why let's take a look at some traces:
 
 ![Traces before monokernel](/images/blog/qwen38-flash-next-mi355x/before_mono.png)
-*Figure 3: Kernel trace of a full decode step at concurrency 1 without monokernel*
+
+<p style="text-align: center;"><em>Figure 3: Kernel trace of a full decode step at concurrency 1 without monokernel</em></p>
 
 Figure 3 shows the full trace of a single decode step at concurrency 1. As you can see, it takes roughly 14ms and over **1600 individual kernel launches**.
 Now, launching a lot of kernels is not necessarily a problem as HIP graphs can get rid of kernel launch overheads but in this case it actually is. The issue is that these kernels are all very small so the GPU is not doing useful work but rather spending most if the time moving data from and to HBM memory.
@@ -404,7 +406,8 @@ In order to achieve the best possible performance at low concurrency, we decided
 As we saw in figure 2, the basic building block for Qwen3.8-Flash-Next is 3x GDN layers followed by a QSA layer, repeated 12 times for a total of 48 hidden layers. We implemented a specialized FlyDSL kernel that replaces this basic building block with a **single kernel launch**.
 
 ![Traces with monokernel](/images/blog/qwen38-flash-next-mi355x/after_mono.png)
-*Figure 4: Kernel trace of a full decode step at concurrency 1 with the new FlyDSL monokernel*
+
+<p style="text-align: center;"><em>Figure 4: Kernel trace of a full decode step at concurrency 1 with the new FlyDSL monokernel</em></p>
 
 Figure 4 shows a full decode step with the monokernel on. With this, we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
 
