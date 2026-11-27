@@ -149,8 +149,8 @@ the cache pool. It needs no counts, no offsets and no copy.
 into the grid, and size waves and tiles for MFMA. Check **Grid Size** and
 **CU Utilization** at the batch sizes you actually serve, not only the largest.
 
-**End to end** ([sglang#45196](https://github.com/sgl-project/sglang/pull/45196):
-InferenceX AgentX, MI355X TP1, concurrency 16, 1 hour): QSA attention drops
+**End to end** (InferenceX AgentX, MI355X TP1, concurrency 16, 1 hour): QSA
+attention drops
 from 9.4% to 2.8% of decode GPU time. Interactivity p50 rises **+12.7%**
 (127.4 → 143.5 tok/s/user), ITL p50 falls **−11.2%** (7.85 → 6.97 ms), and
 throughput rises +3.3% (78,957 → 81,530 tok/s/GPU).
