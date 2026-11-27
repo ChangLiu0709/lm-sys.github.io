@@ -6,7 +6,7 @@ previewImg: /images/blog/qwen38-flash-next-mi355x/preview.png
 type: blog
 ---
 
-Qwen3.8-Flash-Next is an efficient, open-weight MoE model, previewing the next-generation Qwen4 architecture. It has gained significant attention in the open-source community due to its strong coding and agentic capabilities, ultra-sparse architecture, and innovations such as Gated DeltaNet (GDN) and Qwen Sparse Attention (QSA) for efficient long-context inference. Given these strengths, enabling and optimizing Qwen3.8-Flash-Next inference on AMD Instinct™ GPUs is important. In this blog, we demonstrate how to optimize its inference performance in SGLang on AMD GPUs. We benchmark inference performance using InferenceX AgentX, which replays realistic multi-turn agentic coding workloads and measures throughput and interactivity across different concurrency levels. Our optimized AMD MI355X implementation outperforms NVIDIA B200 and B300 GPUs across all tested concurrency levels.
+Qwen3.8-Flash-Next is an efficient, open-weight MoE model, previewing the next-generation Qwen4 architecture. It has gained significant attention in the open-source community due to its strong coding and agentic capabilities, ultra-sparse architecture, and innovations such as Gated DeltaNet (GDN) and Qwen Sparse Attention (QSA) for efficient long-context inference. Given these strengths, enabling and optimizing Qwen3.8-Flash-Next inference on AMD Instinct™ GPUs is important. In this blog, we demonstrate how to optimize its inference performance in SGLang on AMD GPUs. We benchmark inference performance using InferenceX AgentX, which replays realistic multi-turn agentic coding workloads and measures throughput and interactivity across different concurrency levels. Our optimized implementation delivers strong inference performance on AMD Instinct MI355X GPUs across all tested concurrency levels.
 
 This post explores how we serve and optimize Qwen3.8-Flash-Next on AMD Instinct MI355X GPUs using SGLang. We begin with our latest InferenceX AgentX benchmark results, followed by a brief introduction of the model architecture, key kernel optimizations for MI355X, including grid sizing for 256 CUs, kernel fusion, MFMA-native layouts, register prefetching, and wave64, and the monokernel for low concurrency. All results can be reproduced using the commands provided in the [SGLang cookbook](https://lmsysorg.mintlify.app/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next#hw=mi355x&variant=default&quant=fp8&strategy=balanced&nodes=single&pleOffload=auto).
 
@@ -16,29 +16,30 @@ We use InferenceX AgentX to evaluate inference performance, as InferenceX is a p
 
 As shown in Figure 1, we ran Qwen3.8-Flash-Next on one MI355X at concurrency 1, 2, 12, 24, 48 and 80 on the SGLang ROCm image lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261117. Each point replays recorded coding-agent sessions from the InferenceX AgentX trace set for 3,600 s. Total throughput per GPU rises from 16.8k to 230.8k tok/s as concurrency grows, while per-user interactivity ranges from ~390 to ~27 tok/s/user. At low concurrency the monokernel drives interactivity; at high concurrency kernel fusion and HiCache keep throughput scaling.
 
-![InferenceX AgentX: token throughput per chip vs. P90 interactivity](/images/blog/qwen38-flash-next-mi355x/agentx_performance.jpg)
+![InferenceX AgentX: token throughput per chip vs. P90 interactivity](/images/blog/qwen38-flash-next-mi355x/agentx_performance.png)
 
-*Figure 1: Screenshot of InferenceX AgentX Qwen3.8-Flash-Next performance: total throughput per GPU against interactivity across concurrency 1–80, comparing NVIDIA B200, NVIDIA B300, and AMD MI355X.*
+<p style="text-align: center;"><em>Figure 1: Screenshot of InferenceX AgentX Qwen3.8-Flash-Next performance: total throughput per GPU against interactivity across concurrency 1–80, comparing NVIDIA B200, NVIDIA B300, and AMD MI355X.</em></p>
 
 At high concurrency (24–80), the workload is dominated by long, largely shared prompts, so prefill speed and cache capacity matter as much as decode speed. Our MI355X run reaches about 126k tokens/s per chip at conc=24 and about 231k at conc=80, matching or exceeding B300 at the same P90 interactivity and staying well above B200 and our previous MI355X results. At low concurrency (1–2), decoding is bound by kernel launches, not arithmetic: one decode step took about 14 ms across more than 1,600 small kernels. Our monokernel, a persistent FlyDSL kernel that runs a full MTP verify step in 13 launches, cuts that to about 4 ms. P90 interactivity reaches about 390 tokens/s/user at one agent, where B300's curve falls off to a few thousand tokens/s per chip. We will give more details about the optimizations in the latter sections.
 
-**NOTE:** Until the day Nov 19, 2026, we wrote the blog and the performance submission shown in the figure depended on 7 PRs that awaited to be merged to the SGLang main branch.
+**NOTE:** As of November 19, 2026, when we drafted the blog, the performance submission shown in the figure depended on seven PRs that were still awaiting merge into SGLang's main branch.
 
 ## Qwen3.8-Flash-Next Model Architecture
 
-Figure 2 recaps the Qwen3.8-Flash-Next model architecture. For inference, these properties of the architecture matter:
+<img src="/images/blog/qwen38-flash-next-mi355x/architecture.png" alt="Qwen3.8-Flash-Next Model Architecture" style="display:block; margin-left: auto; margin-right: auto; width: 80%;"></img>
+
+<p style="text-align: center;"><em>Figure 2: Qwen3.8-Flash-Next model architecture</em></p>
+
+Figure 2 shows the main building blocks of the model:
 
 - **Gated Delta Net.** 36 of the 48 layers use Gated Delta Net, a linear-attention layer with a fixed-size recurrent state per request, so its decode cost does not grow with context.
 - **Query Sparse Attention.** The other 12 use Query Sparse Attention: each query attends to a learned selection of past positions, with 24 query heads sharing 2 KV heads of dimension 256.
 - **Hyper-connections.** Instead of one residual stream, the model keeps 4 streams of width 2,560. Before every block a gated mix collapses them into one input. It is small but runs in every layer at every step.
 - **Native MTP.** A built-in draft layer proposes tokens for speculative decoding, verified by the target in one forward pass.
 
-![Qwen3.8-Flash-Next Model Architecture](/images/blog/qwen38-flash-next-mi355x/architecture.png)
-*Figure 2: Qwen3.8-Flash-Next model architecture*
-
 ### The checkpoint: MXFP4 experts with AMD Quark
 
-For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next model weights using [AMD Quark](https://github.com/amd/quark), a model optimization toolkit that supports post-training quantization for efficient inference on AMD hardware. The resulting quantized model reduces GPU memory consumption and improves inference efficiency. In our experiments, we serve `[amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)`.
+For AMD Instinct GPUs, we quantized the Qwen3.8-Flash-Next model weights using [AMD Quark](https://github.com/amd/quark), a model optimization toolkit that supports post-training quantization for efficient inference on AMD hardware. The resulting quantized model reduces GPU memory consumption and improves inference efficiency. In our experiments, we serve [amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8).
 
 The quantized checkpoint occupies approximately 116 GB, fitting comfortably on a single AMD Instinct MI355X GPU (288 GB HBM3E) while leaving enough memory for a large KV cache, enabling higher concurrency and more efficient inference serving. The MTP draft model is quantized using the same approach as the target model, allowing its MoE layers to benefit from the same optimized MXFP4 kernels.
 
@@ -63,8 +64,7 @@ Table 1 shows what this means at concurrency 8 and 16:
 | 8 | 16 | **16 of 256** (6%) | 128 | **5.4%** | 69.5 µs |
 | 16 | 32 | **32 of 256** (13%) | 256 | **10.8%** | 69.7 µs |
 
-*Table 1: Workgroups, busy CUs and CU Utilization of `_sparse_gqa_chunk_prefill`
-at concurrency 8 and 16*
+<p style="text-align: center;"><em>Table 1: Workgroups, busy CUs and CU Utilization of <code>_sparse_gqa_chunk_prefill</code> at concurrency 8 and 16</em></p>
 
 At concurrency 8, 240 of the 256 CUs sit idle for the entire 70 µs; at
 concurrency 16, 224 do. Each CU that does have work holds a single workgroup,
@@ -88,7 +88,7 @@ launch configuration in Table 2:
 | Tile | **16 rows × 32 tokens** (12 GQA heads padded to 16) |
 | Loop | **65 steps** of 32 positions per workgroup |
 
-*Table 2: Launch configuration of the Triton kernel at batch 8*
+<p style="text-align: center;"><em>Table 2: Launch configuration of the Triton kernel at batch 8</em></p>
 
 This leads to three problems:
 
@@ -119,15 +119,15 @@ positions of one row and KV head are distributed before and after.
 | Tile | per wave **16 tokens × 16 heads**, one 16 × 16 × 32 MFMA tile |
 | Loop | 192 positions per split = **3 rounds** of 4 waves × 16 tokens |
 
-*Table 3: Launch configuration of the FlyDSL split-KV kernel at batch 8*
+<p style="text-align: center;"><em>Table 3: Launch configuration of the FlyDSL split-KV kernel at batch 8</em></p>
 
 ![QSA decode work split at batch 8, before and after split-KV](/images/blog/qwen38-flash-next-mi355x/shape_qsa_split_kv.svg)
-*Figure 3: Work split of one row and KV head, and the resulting CU occupancy at
-batch 8, before (Triton) and after (FlyDSL split-KV)*
+
+<p style="text-align: center;"><em>Figure 3: Work split of one row and KV head, and the resulting CU occupancy at batch 8, before (Triton) and after (FlyDSL split-KV)</em></p>
 
 ![QSA attention kernel CU utilization vs batch](/images/blog/qwen38-flash-next-mi355x/shape_qsa_batch.png)
-*Figure 4: CU Utilization of the QSA attention kernel across batch sizes, before
-and after split-KV (rocprof-compute)*
+
+<p style="text-align: center;"><em>Figure 4: CU Utilization of the QSA attention kernel across batch sizes, before and after split-KV (rocprof-compute)</em></p>
 
 As Figure 4 shows, with split-KV CU utilization no longer tracks the batch
 size alone. Before
@@ -137,8 +137,8 @@ onward. At batch 1 it stays at 8%, because the 128-position minimum per split
 caps the grid at 34 workgroups.
 
 ![QSA decode kernel trace at batch 16, before and after](/images/blog/qwen38-flash-next-mi355x/shape_qsa_trace.png)
-*Figure 5: Kernel trace of one QSA decode call at batch 16, before and after
-(rocprofv3)*
+
+<p style="text-align: center;"><em>Figure 5: Kernel trace of one QSA decode call at batch 16, before and after (rocprofv3)</em></p>
 
 The kernel trace at batch 16 (Figure 5) shows the cost of the extra reduce
 kernel: only
@@ -223,12 +223,12 @@ owning one 16-column tile. Figure 6 contrasts the two ways of assigning the
 down-GEMV work to waves.
 
 ![HC down GEMV, before and after](/images/blog/qwen38-flash-next-mi355x/mma_hc_waves.svg)
-*Figure 6: Assignment of down-GEMV tiles to waves, before (8 waves share one
-tile) and after (one wave per tile and k slice)*
+
+<p style="text-align: center;"><em>Figure 6: Assignment of down-GEMV tiles to waves, before (8 waves share one tile) and after (one wave per tile and k slice)</em></p>
 
 ![HC MFMA count before and after (rocprof-compute)](/images/blog/qwen38-flash-next-mi355x/mma_hc_mfma.png)
-*Figure 7: Total wavefronts and MFMA instructions of the HC mix kernels at
-batch 1, before and after (rocprof-compute)*
+
+<p style="text-align: center;"><em>Figure 7: Total wavefronts and MFMA instructions of the HC mix kernels at batch 1, before and after (rocprof-compute)</em></p>
 
 rocprof-compute confirms that the copies are gone (Figure 7). The down GEMV
 now issues
@@ -264,9 +264,7 @@ Table 4 breaks the time and traffic down by kernel.
 | output o | 0.50 ms | 49,152 | 2.8 GB | 0.4 GB |
 | **total** | **3.0 ms** | | **11.0 GB** | **3.3 GB** |
 
-*Table 4: Time, workgroups and HBM traffic of the Triton GDN kernels for one
-layer at 32K tokens. Times are from the kernel trace; bytes are from
-rocprof-compute block 17 and exclude the two copy kernels.*
+<p style="text-align: center;"><em>Table 4: Time, workgroups and HBM traffic of the Triton GDN kernels for one layer at 32K tokens. Times are from the kernel trace; bytes are from rocprof-compute block 17 and exclude the two copy kernels.</em></p>
 
 #### Nine Kernels, Each a Round Trip Through HBM
 
@@ -286,8 +284,7 @@ $$
 \end{array}
 $$
 
-*Table 5: Per-chunk steps of GDN chunked prefill and the Triton kernel that
-runs each one*
+<p style="text-align: center;"><em>Table 5: Per-chunk steps of GDN chunked prefill and the Triton kernel that runs each one</em></p>
 
 Only the inputs and the output o need to touch HBM: about 0.7 GB read and
 0.4 GB written per layer at 32K tokens. The Triton path, however, runs each
@@ -314,12 +311,12 @@ intermediates stay on chip and only o leaves it. Figure 8 shows where the data
 goes in both versions.
 
 ![GDN data flow per layer, before and after](/images/blog/qwen38-flash-next-mi355x/mem_gdn_flow.svg)
-*Figure 8: Data flow and HBM traffic of one GDN layer at 32K tokens: 9 Triton
-kernels versus one fused FlyDSL kernel*
+
+<p style="text-align: center;"><em>Figure 8: Data flow and HBM traffic of one GDN layer at 32K tokens: 9 Triton kernels versus one fused FlyDSL kernel</em></p>
 
 ![GDN kernel trace, one layer at 32K tokens, before and after](/images/blog/qwen38-flash-next-mi355x/mem_gdn_trace.png)
-*Figure 9: Kernel trace of one GDN layer at 32K tokens, before and after
-(rocprofv3)*
+
+<p style="text-align: center;"><em>Figure 9: Kernel trace of one GDN layer at 32K tokens, before and after (rocprofv3)</em></p>
 
 In the trace (Figure 9), one layer drops from 9 kernels and 3.0 ms to a single kernel and
 1.6 ms (**1.9×**). The fused kernel takes only 0.26 ms longer than the old
@@ -391,12 +388,12 @@ changing its dtype. The cache is a read-only table of 256K positions ×
 how the cache dtype decides between the two paths before and after the fix.
 
 ![QSA indexer prep, before and after the fix](/images/blog/qwen38-flash-next-mi355x/dispatch_qsa_indexer.svg)
-*Figure 10: How the dtype of `cos_sin_cache` selects the eager or the fused
-indexer path, before and after the fix*
+
+<p style="text-align: center;"><em>Figure 10: How the dtype of <code>cos_sin_cache</code> selects the eager or the fused indexer path, before and after the fix</em></p>
 
 ![QSA indexer prep kernel trace at batch 8, before and after](/images/blog/qwen38-flash-next-mi355x/dispatch_qsa_indexer_trace.png)
-*Figure 11: Kernel trace of the QSA indexer prep for one layer at batch 8,
-before and after the fix (rocprofv3)*
+
+<p style="text-align: center;"><em>Figure 11: Kernel trace of the QSA indexer prep for one layer at batch 8, before and after the fix (rocprofv3)</em></p>
 
 With the fused path back, the kernel trace (Figure 11) shows the indexer prep
 of one layer dropping from 45 kernels
@@ -428,29 +425,35 @@ slow. If a layer launches far more kernels on one platform than on another,
 look for a fallback — in the kernel trace, count the kernels per layer and
 watch for runs of tiny kernels on one or two workgroups.
 
-### Monokernel
+## Improving interactivity at low concurrency with monokernels
 
-When we first benchmarked this model on AMD MI355X we quickly realized that the low concurrency region (i.e., <= 8) was going to be the most critical for us in terms of performance.
+When we first benchmarked this model we quickly realized that optimizing the low concurrency region (i.e., <= 8) was going to be a challenge.
+To understand why let's take a look at some traces:
 
 ![Traces before monokernel](/images/blog/qwen38-flash-next-mi355x/before_mono.png)
-*Figure 12: Kernel trace of a full decode step at concurrency 1 without the monokernel*
 
-Figure 12 shows the full trace of one decode step at concurrency 1. As you can see, it takes roughly 14ms for a total of over **1600 individual kernel launches**.
-Launching a lot of kernels is not necessarily a problem as HIP graphs can get rid of kernel launch overheads but in this case it actually is. The issues is that these kernels are all very small so the GPU is not doing useful work but mostly loading data from and to HBM memory. In this scenario, the most practical optimization strategy is simply trying to reduce as much as possible the HBM traffic, this means fusing multiple operations together.
+<p style="text-align: center;"><em>Figure 12: Kernel trace of a full decode step at concurrency 1 without the monokernel</em></p>
+
+Figure 12 shows the full trace of a single decode step at concurrency 1. As you can see, it takes roughly 14ms and over **1600 individual kernel launches**.
+Now, launching a lot of kernels is not necessarily a problem as HIP graphs can get rid of kernel launch overheads but in this case it actually is. The issue is that these kernels are all very small so the GPU is not doing useful work but rather spending most if the time moving data from and to HBM memory.
+
+In this scenario, the most practical optimization strategy is simply trying to reduce the HBM traffic as much as possible, this means fusing multiple operations together.
 
 In order to achieve the best possible performance at low concurrency, we decided to fuse as many kernels as possible into a single (mono) kernel.
 As we saw in Figure 2, the basic building block for Qwen3.8-Flash-Next is 3x GDN layers followed by a QSA layer, repeated 12 times for a total of 48 hidden layers. We implemented a specialized FlyDSL kernel that replaces this basic building block with a **single kernel launch**.
 
 ![Traces with monokernel](/images/blog/qwen38-flash-next-mi355x/after_mono.png)
-*Figure 13: Kernel trace of a full decode step at concurrency 1 with the new FlyDSL monokernel*
 
-Figure 13 shows a full decode step with the monokernel on. With this we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
+<p style="text-align: center;"><em>Figure 13: Kernel trace of a full decode step at concurrency 1 with the new FlyDSL monokernel</em></p>
+
+Figure 13 shows a full decode step with the monokernel on. With this, we got rid of over 1600 kernel launches and replaced them with just **13** and went from almost **14ms to 4ms**, that's over **3x improvement** in decode speed.
 
 For more details, the monokernel source code is available on [GitHub](https://github.com/sgl-project/sgl-amd-mono/tree/main/sgl_amd_mono/qwen38_flash_next).
 
 ## Conclusion
+In this blog post, we present the inference performance of Qwen3.8-Flash-Next on a single AMD Instinct MI355X GPU, achieving approximately 231K tokens/s per GPU at concurrency 80 and 390 tokens/s per user at concurrency 1, measured using InferenceX AgentX.
 
-With a Quark MXFP4 checkpoint that fits on a single MI355X and a set of MI355X-specific kernels in SGLang, Qwen3.8-Flash-Next reaches about 231k tokens/s per GPU at concurrency 80 and about 390 tokens/s/user at concurrency 1 on InferenceX AgentX, matching or exceeding B300 and staying well above B200 across the range we tested. Two kinds of change made the difference. Rewriting the NVIDIA-oriented kernels around the MI355X (a grid sized for 256 CUs, MFMA-native layouts, and intermediates kept on chip) improves the high-concurrency regime. At low concurrency, the FlyDSL monokernel replaces more than 1,600 launches per decode step with 13 and cuts the step from about 14 ms to 4 ms. The kernel changes are pull requests to SGLang and AITER, and the monokernel is open source in `sgl-amd-mono`, so you can reproduce the results with the SGLang cookbook and try them on your own workloads.
+We then introduce the model architecture and highlight key SGLang kernel optimizations: GDN, QSA, and hyper-connection kernels for high concurrency, and a persistent FlyDSL monokernel for low concurrency. Together, these hardware-aware optimizations deliver strong inference performance across the tested concurrency range.
 
 ## Acknowledgements
 
