@@ -414,8 +414,9 @@ Figure 4 shows a full decode step with the monokernel on. With this, we got rid 
 For more details, the monokernel source code is available on [GitHub](https://github.com/sgl-project/sgl-amd-mono/tree/main/sgl_amd_mono/qwen38_flash_next).
 
 ## Conclusion
+In this blog post, we present the inference performance of Qwen3.8-Flash-Next on a single AMD Instinct MI355X GPU, achieving approximately 231K tokens/s per GPU at concurrency 80 and 390 tokens/s per user at concurrency 1, measured using InferenceX AgentX.
 
-We then introduce the model architecture and highlight key SGLang kernel optimizations: **GDN, QSA, and hyper-connection kernels for high concurrency**, and **a persistent FlyDSL monokernel for low concurrency**. Together, these hardware-aware optimizations deliver strong inference performance across the benchmarked concurrency range.
+We then introduce the model architecture and highlight key SGLang kernel optimizations: GDN, QSA, and hyper-connection kernels for high concurrency, and a persistent FlyDSL monokernel for low concurrency. Together, these hardware-aware optimizations deliver strong inference performance across the tested concurrency range.
 
 ## Acknowledgements
 
